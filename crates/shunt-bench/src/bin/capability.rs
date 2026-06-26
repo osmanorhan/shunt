@@ -16,10 +16,12 @@ use shunt_bench::capability::{Catalog, Difficulty, render_report, run_catalog_fi
 /// Every LLM request/response body is logged at DEBUG level by shunt_infer.
 fn init_debug_log() {
     use tracing_subscriber::{EnvFilter, fmt, prelude::*};
-    let filter = EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| EnvFilter::new("shunt_infer=debug"));
+    let filter =
+        EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("shunt_infer=debug"));
     let file = match std::fs::OpenOptions::new()
-        .create(true).write(true).truncate(true)
+        .create(true)
+        .write(true)
+        .truncate(true)
         .open("capability-debug.log")
     {
         Ok(f) => f,
@@ -27,7 +29,11 @@ fn init_debug_log() {
     };
     let _ = tracing_subscriber::registry()
         .with(filter)
-        .with(fmt::layer().with_writer(std::sync::Mutex::new(file)).with_ansi(false))
+        .with(
+            fmt::layer()
+                .with_writer(std::sync::Mutex::new(file))
+                .with_ansi(false),
+        )
         .try_init();
 }
 
@@ -35,10 +41,15 @@ fn main() -> ExitCode {
     init_debug_log();
     let args: Vec<String> = std::env::args().skip(1).collect();
     let hard_only = args.iter().any(|a| a == "--hard");
-    let task_filter: Option<&str> = args.iter()
+    let task_filter: Option<&str> = args
+        .iter()
         .find(|a| a.starts_with("--task="))
         .map(|a| a.trim_start_matches("--task="));
-    let positional: Vec<&str> = args.iter().filter(|a| !a.starts_with("--")).map(|s| s.as_str()).collect();
+    let positional: Vec<&str> = args
+        .iter()
+        .filter(|a| !a.starts_with("--"))
+        .map(|s| s.as_str())
+        .collect();
 
     let catalog_path = positional.first().copied().unwrap_or("models.toml");
     let runs: usize = positional.get(1).and_then(|s| s.parse().ok()).unwrap_or(1);
@@ -63,10 +74,19 @@ fn main() -> ExitCode {
         return ExitCode::FAILURE;
     }
 
-    let min_difficulty = if hard_only { Some(Difficulty::Medium) } else { None };
+    let min_difficulty = if hard_only {
+        Some(Difficulty::Medium)
+    } else {
+        None
+    };
     let label = if hard_only { " (medium+hard only)" } else { "" };
-    let task_label = task_filter.map(|t| format!(" --task={t}")).unwrap_or_default();
-    eprintln!("Running {} model(s) × suite{label}{task_label} × {runs} run(s)…\n", catalog.model.len());
+    let task_label = task_filter
+        .map(|t| format!(" --task={t}"))
+        .unwrap_or_default();
+    eprintln!(
+        "Running {} model(s) × suite{label}{task_label} × {runs} run(s)…\n",
+        catalog.model.len()
+    );
 
     let cards = run_catalog_filtered(&catalog, runs, min_difficulty, task_filter);
     let report = render_report(&cards);

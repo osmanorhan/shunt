@@ -5,9 +5,9 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 
 use aho_corasick::{AhoCorasick, AhoCorasickBuilder};
-use shunt_core::{CandidateFile, UnderstandingArtifact};
 use ignore::{WalkBuilder, WalkState};
 use serde::{Deserialize, Serialize};
+use shunt_core::{CandidateFile, UnderstandingArtifact};
 mod search;
 pub mod workspace_search;
 
@@ -1727,8 +1727,8 @@ mod tests {
 
     use super::{
         ArtifactQueryPlanner, DefaultLocalizer, Localizer, PipelineLocalizer, QueryPlanner,
-        RetrievalBackend, SearchHit, SearchIntent, SearchQuery, SemanticLocalizer, StructureExtractor,
-        TfIdfRanker, TreeSitterStructureExtractor,
+        RetrievalBackend, SearchHit, SearchIntent, SearchQuery, SemanticLocalizer,
+        StructureExtractor, TfIdfRanker, TreeSitterStructureExtractor,
     };
 
     fn test_artifact(request: &str) -> UnderstandingArtifact {

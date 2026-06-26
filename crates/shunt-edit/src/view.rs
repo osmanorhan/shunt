@@ -31,7 +31,11 @@ fn line_slice(source: &str) -> Vec<&str> {
     if source.is_empty() {
         return Vec::new();
     }
-    source.strip_suffix('\n').unwrap_or(source).split('\n').collect()
+    source
+        .strip_suffix('\n')
+        .unwrap_or(source)
+        .split('\n')
+        .collect()
 }
 
 fn render(lines: &[&str], first_no: usize, last_no: usize) -> String {
@@ -56,7 +60,10 @@ mod tests {
 
     #[test]
     fn gutter_width_adapts() {
-        let src = (1..=10).map(|i| format!("L{i}")).collect::<Vec<_>>().join("\n");
+        let src = (1..=10)
+            .map(|i| format!("L{i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
         let out = numbered(&src);
         // 1-digit numbers are right-aligned to width 2.
         assert!(out.starts_with(" 1: L1\n"));

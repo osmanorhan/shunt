@@ -52,7 +52,11 @@ impl WorkspaceSearch {
                 continue;
             }
             // Content match — skip oversized/binary files.
-            if path.metadata().map(|m| m.len() > MAX_CONTENT_BYTES).unwrap_or(true) {
+            if path
+                .metadata()
+                .map(|m| m.len() > MAX_CONTENT_BYTES)
+                .unwrap_or(true)
+            {
                 continue;
             }
             if let Ok(content) = std::fs::read_to_string(path)

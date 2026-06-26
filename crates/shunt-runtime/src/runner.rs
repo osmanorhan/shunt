@@ -14,8 +14,8 @@ use tokio::sync::mpsc;
 use tracing::{debug, warn};
 
 use shunt_core::ledger::{
-    BoundedOutput, CommandObservation, CommandStatus, LedgerEntry, ToolObservation, UserObservation,
-    UserObservationKind,
+    BoundedOutput, CommandObservation, CommandStatus, LedgerEntry, ToolObservation,
+    UserObservation, UserObservationKind,
 };
 use shunt_core::machine::{Effect, MachineEvent, Notification};
 use shunt_core::safety;
@@ -169,8 +169,8 @@ impl<P: ToolProvider + Clone + Send + Sync + 'static> EffectRunner<P> {
                 let ignore_patterns = self.ignore_patterns.clone();
                 let tx_clone = tx.clone();
                 tokio::task::spawn_blocking(move || {
-                    use shunt_core::machine::{ArtifactSnapshot, FileDiff};
                     use shunt_core::FileOp;
+                    use shunt_core::machine::{ArtifactSnapshot, FileDiff};
                     let mut rt = match open_runtime(&store_path) {
                         Ok(rt) => rt,
                         Err(err) => {
@@ -250,25 +250,26 @@ impl<P: ToolProvider + Clone + Send + Sync + 'static> EffectRunner<P> {
                     ));
 
                     // Hand the decision (approve vs auto-commit) back to the machine.
-                    let artifact = rt.store.get_understanding_artifact(&artifact_id.0).ok().flatten();
+                    let artifact = rt
+                        .store
+                        .get_understanding_artifact(&artifact_id.0)
+                        .ok()
+                        .flatten();
                     let confidence = artifact.as_ref().map(|a| a.confidence).unwrap_or(0.0);
                     let snapshot = ArtifactSnapshot {
-                        interpreted_goal: artifact
-                            .map(|a| a.interpreted_goal)
-                            .unwrap_or_default(),
+                        interpreted_goal: artifact.map(|a| a.interpreted_goal).unwrap_or_default(),
                         confidence,
                         evidence_count: 0,
                         candidate_paths: op_paths.clone(),
                         open_ambiguity_count: 0,
                         open_risks: vec![],
                     };
-                    let _ = tx_clone.blocking_send(RunnerMessage::Event(
-                        MachineEvent::ProposalReady {
+                    let _ =
+                        tx_clone.blocking_send(RunnerMessage::Event(MachineEvent::ProposalReady {
                             confidence,
                             op_count: op_paths.len(),
                             snapshot,
-                        },
-                    ));
+                        }));
                 });
             }
 

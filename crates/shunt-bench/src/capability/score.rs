@@ -67,7 +67,11 @@ impl TaskScore {
         if self.runs.is_empty() {
             0.0
         } else {
-            self.runs.iter().map(|r| r.elapsed.as_secs_f32()).sum::<f32>() / self.n() as f32
+            self.runs
+                .iter()
+                .map(|r| r.elapsed.as_secs_f32())
+                .sum::<f32>()
+                / self.n() as f32
         }
     }
     pub fn avg_tool_calls(&self) -> f32 {

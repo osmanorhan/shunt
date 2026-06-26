@@ -75,7 +75,14 @@ impl TaskMachine {
             ),
 
             // ── Proposal ready → approval gate (per policy) ───────────────
-            (Running, ProposalReady { confidence, op_count, snapshot }) => {
+            (
+                Running,
+                ProposalReady {
+                    confidence,
+                    op_count,
+                    snapshot,
+                },
+            ) => {
                 if op_count == 0 {
                     // Nothing to apply — the agent decided no change was needed.
                     (
@@ -116,7 +123,14 @@ impl TaskMachine {
             }
 
             // ── Agent asked the developer a question → pause ──────────────
-            (Running, AgentAsked { ambiguity_id, question, options }) => (
+            (
+                Running,
+                AgentAsked {
+                    ambiguity_id,
+                    question,
+                    options,
+                },
+            ) => (
                 WaitingForUser {
                     request: UserRequest::Clarification {
                         open: vec![PendingAmbiguity {
@@ -486,7 +500,11 @@ mod tests {
             &auto_policy(),
         );
         assert!(matches!(next, TaskState::Running));
-        assert!(effects.iter().any(|e| matches!(e, Effect::CommitChange { .. })));
+        assert!(
+            effects
+                .iter()
+                .any(|e| matches!(e, Effect::CommitChange { .. }))
+        );
     }
 
     #[test]
@@ -503,10 +521,17 @@ mod tests {
         assert!(matches!(
             next,
             TaskState::WaitingForUser {
-                request: UserRequest::Approval { candidate_count: 2, .. }
+                request: UserRequest::Approval {
+                    candidate_count: 2,
+                    ..
+                }
             }
         ));
-        assert!(!effects.iter().any(|e| matches!(e, Effect::CommitChange { .. })));
+        assert!(
+            !effects
+                .iter()
+                .any(|e| matches!(e, Effect::CommitChange { .. }))
+        );
     }
 
     #[test]
@@ -542,10 +567,11 @@ mod tests {
                 request: UserRequest::Clarification { .. }
             }
         ));
-        assert!(effects.iter().any(|e| matches!(
-            e,
-            Effect::Notify(Notification::ClarificationNeeded { .. })
-        )));
+        assert!(
+            effects
+                .iter()
+                .any(|e| matches!(e, Effect::Notify(Notification::ClarificationNeeded { .. })))
+        );
     }
 
     // ── Clarification answer ─────────────────────────────────────────────────

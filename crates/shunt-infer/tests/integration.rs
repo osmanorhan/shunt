@@ -15,8 +15,8 @@ use std::fs;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use shunt_infer::{AgentObserver, AgentResult, AgentSession, OpenAiCompatProvider, ProposedFileOp};
 use serde_json::Value;
+use shunt_infer::{AgentObserver, AgentResult, AgentSession, OpenAiCompatProvider, ProposedFileOp};
 use tempfile::TempDir;
 
 struct PrintObserver;

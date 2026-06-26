@@ -202,6 +202,43 @@ struct AgentAction {
     setup_commands: Vec<ProposedCommand>,
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum AgentActionEnvelope {
+    Direct(AgentAction),
+    Action { action: AgentAction },
+    Actions { actions: Vec<AgentAction> },
+}
+
+impl AgentActionEnvelope {
+    fn into_action(self) -> AgentAction {
+        match self {
+            Self::Direct(action) | Self::Action { action } => action,
+            Self::Actions { mut actions } => {
+                actions.drain(..).next().unwrap_or_else(|| AgentAction {
+                    tool: "think".into(),
+                    path: None,
+                    start_line: None,
+                    end_line: None,
+                    patch: None,
+                    old_str: None,
+                    new_str: None,
+                    query: None,
+                    cmd: None,
+                    args: vec![],
+                    question: None,
+                    context: Some(
+                        "model returned an empty actions array; choose one action".into(),
+                    ),
+                    task: None,
+                    description: None,
+                    setup_commands: vec![],
+                })
+            }
+        }
+    }
+}
+
 // ── Public types ──────────────────────────────────────────────────────────────
 
 /// One recorded agent turn: what tool was called and what the result was.
@@ -671,11 +708,7 @@ impl<'a, P: ToolProvider> AgentSession<'a, P> {
 
         for turn_idx in 0..self.budget.max_turns {
             // Evict old turn history if approaching the token budget.
-            evict_history_if_needed(
-                &mut self.conv_history,
-                &mut self.cold_entries,
-                &self.turns,
-            );
+            evict_history_if_needed(&mut self.conv_history, &mut self.cold_entries, &self.turns);
 
             // Build the ephemeral continuation message: current FILES state + nudge.
             // This is NOT stored in conv_history — it's rebuilt fresh every turn so
@@ -717,13 +750,13 @@ impl<'a, P: ToolProvider> AgentSession<'a, P> {
                 let mut last_err = None;
                 let mut result = None;
                 for attempt in 0..3u8 {
-                    match self.provider.generate_from_messages(
+                    match self.provider.generate_from_messages::<AgentActionEnvelope>(
                         "agent_action",
                         &inference_messages,
                         &schema,
                     ) {
                         Ok(a) => {
-                            result = Some(a);
+                            result = Some(a.into_action());
                             break;
                         }
                         Err(e) => {
@@ -740,9 +773,8 @@ impl<'a, P: ToolProvider> AgentSession<'a, P> {
                 match result {
                     Some(a) => a,
                     None => {
-                        let err_msg = format!(
-                            "all 3 retries exhausted on turn {turn_idx}: {last_err:?}"
-                        );
+                        let err_msg =
+                            format!("all 3 retries exhausted on turn {turn_idx}: {last_err:?}");
                         tracing::error!("AgentSession {err_msg}");
                         if let Some(o) = &self.observer {
                             o.on_note(&format!("ERROR: {err_msg}"));
@@ -871,9 +903,7 @@ impl<'a, P: ToolProvider> AgentSession<'a, P> {
                     // on the same tool with ok:false the model is stuck in a loop
                     // (e.g. repeatedly emitting replace_lines with no path field).
                     // Abort immediately — retrying won't help.
-                    let failed_streak: Vec<_> = self.turns.iter().rev()
-                        .take(3)
-                        .collect();
+                    let failed_streak: Vec<_> = self.turns.iter().rev().take(3).collect();
                     if failed_streak.len() == 3
                         && failed_streak.iter().all(|t| !t.ok)
                         && failed_streak.windows(2).all(|w| w[0].tool == w[1].tool)
@@ -1002,14 +1032,22 @@ impl<'a, P: ToolProvider> AgentSession<'a, P> {
                     let mut depth: i32 = 0;
                     for line in file_lines.iter().take(scan_end).skip(start - 1) {
                         for ch in line.chars() {
-                            match ch { '{' => depth += 1, '}' => depth -= 1, _ => {} }
+                            match ch {
+                                '{' => depth += 1,
+                                '}' => depth -= 1,
+                                _ => {}
+                            }
                         }
                     }
                     if depth > 0 {
                         let mut expanded = end;
                         for (i, line) in file_lines.iter().enumerate().skip(scan_end) {
                             for ch in line.chars() {
-                                match ch { '{' => depth += 1, '}' => depth -= 1, _ => {} }
+                                match ch {
+                                    '{' => depth += 1,
+                                    '}' => depth -= 1,
+                                    _ => {}
+                                }
                             }
                             if depth <= 0 {
                                 expanded = i + 1; // 1-indexed
@@ -1027,7 +1065,11 @@ impl<'a, P: ToolProvider> AgentSession<'a, P> {
                 // Show the model exactly the lines it is replacing (with numbers),
                 // or for append, show the tail of the file as context.
                 let target = if is_append {
-                    shunt_edit::numbered_window(&current, total_lines.saturating_sub(2), total_lines)
+                    shunt_edit::numbered_window(
+                        &current,
+                        total_lines.saturating_sub(2),
+                        total_lines,
+                    )
                 } else {
                     shunt_edit::numbered_window(&current, start, end)
                 };
@@ -1045,7 +1087,8 @@ impl<'a, P: ToolProvider> AgentSession<'a, P> {
                 // Show context around target range for indentation/sibling awareness.
                 let ctx_lo = start.saturating_sub(3).max(1);
                 let ctx_hi = (end + 3).min(total_lines);
-                let context_before = shunt_edit::numbered_window(&current, ctx_lo, start.saturating_sub(1));
+                let context_before =
+                    shunt_edit::numbered_window(&current, ctx_lo, start.saturating_sub(1));
                 let context_after = if is_append {
                     String::new()
                 } else {
@@ -1054,7 +1097,9 @@ impl<'a, P: ToolProvider> AgentSession<'a, P> {
                 let ctx_section = {
                     let mut s = String::new();
                     if !context_before.is_empty() || !context_after.is_empty() {
-                        s.push_str("Surrounding context (do NOT reproduce these lines in your output):\n");
+                        s.push_str(
+                            "Surrounding context (do NOT reproduce these lines in your output):\n",
+                        );
                         s.push_str(&context_before);
                         s.push_str(&context_after);
                         s.push('\n');
@@ -1090,7 +1135,9 @@ impl<'a, P: ToolProvider> AgentSession<'a, P> {
                     if is_append {
                         o.on_note(&format!("Generating content to append to {path}…"));
                     } else {
-                        o.on_note(&format!("Generating replacement for {path} lines {start}-{end}…"));
+                        o.on_note(&format!(
+                            "Generating replacement for {path} lines {start}-{end}…"
+                        ));
                     }
                 }
                 let new_content = match self.provider.generate_text(text_system, &base_user) {
@@ -1107,7 +1154,9 @@ impl<'a, P: ToolProvider> AgentSession<'a, P> {
                     }
                     Err(e) => {
                         return Dispatch::Continue {
-                            result: format!("Error: replacement generation failed for '{path}': {e}"),
+                            result: format!(
+                                "Error: replacement generation failed for '{path}': {e}"
+                            ),
                             ok: false,
                         };
                     }
@@ -1168,7 +1217,10 @@ impl<'a, P: ToolProvider> AgentSession<'a, P> {
                                  different file/range if more changes are needed."
                             )
                         };
-                        Dispatch::Continue { result: msg, ok: true }
+                        Dispatch::Continue {
+                            result: msg,
+                            ok: true,
+                        }
                     }
                     Err(e) => Dispatch::Continue {
                         result: format!("Error applying edit to '{path}': {e}"),
@@ -2377,7 +2429,11 @@ fn compress_for_cold_storage(content: &str, tool: &str) -> String {
     match tool {
         "think" => {
             let preview = content.chars().take(80).collect::<String>();
-            format!("[thought: {}… ({} chars — evicted)]", preview.trim(), content.len())
+            format!(
+                "[thought: {}… ({} chars — evicted)]",
+                preview.trim(),
+                content.len()
+            )
         }
         "search_files" => {
             let lines: Vec<&str> = content.lines().collect();
@@ -2500,13 +2556,21 @@ fn render_file_numbered(contents: &str, keywords: &[&str]) -> String {
     let mut prev_end = 0;
     for (s, e) in merged {
         if s > prev_end + 1 {
-            out.push_str(&format!("   … (lines {}-{} omitted) …\n", prev_end + 1, s - 1));
+            out.push_str(&format!(
+                "   … (lines {}-{} omitted) …\n",
+                prev_end + 1,
+                s - 1
+            ));
         }
         out.push_str(&shunt_edit::numbered_window(contents, s, e));
         prev_end = e;
     }
     if prev_end < total {
-        out.push_str(&format!("   … (lines {}-{} omitted) …\n", prev_end + 1, total));
+        out.push_str(&format!(
+            "   … (lines {}-{} omitted) …\n",
+            prev_end + 1,
+            total
+        ));
     }
     out
 }
@@ -2590,6 +2654,43 @@ fn tail_utf8(bytes: &[u8], max: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn action_envelope_accepts_direct_action() {
+        let action: AgentActionEnvelope = serde_json::from_value(serde_json::json!({
+            "tool": "read_file",
+            "path": "src/lib.rs"
+        }))
+        .unwrap();
+        let action = action.into_action();
+        assert_eq!(action.tool, "read_file");
+        assert_eq!(action.path.as_deref(), Some("src/lib.rs"));
+    }
+
+    #[test]
+    fn action_envelope_accepts_action_wrapper() {
+        let action: AgentActionEnvelope = serde_json::from_value(serde_json::json!({
+            "action": {"tool": "search_files", "query": "marker"}
+        }))
+        .unwrap();
+        let action = action.into_action();
+        assert_eq!(action.tool, "search_files");
+        assert_eq!(action.query.as_deref(), Some("marker"));
+    }
+
+    #[test]
+    fn action_envelope_accepts_actions_array() {
+        let action: AgentActionEnvelope = serde_json::from_value(serde_json::json!({
+            "actions": [
+                {"tool": "think", "context": "inspect first"},
+                {"tool": "read_file", "path": "src/lib.rs"}
+            ]
+        }))
+        .unwrap();
+        let action = action.into_action();
+        assert_eq!(action.tool, "think");
+        assert_eq!(action.context.as_deref(), Some("inspect first"));
+    }
 
     #[test]
     fn apply_str_replace_ok() {

@@ -14,13 +14,13 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
+use serde_json::json;
 use shunt_core::{
     CandidateFile, EvidenceKind, EvidenceRef, UnderstandingArtifact, VerifierOutcome,
     VerifierStatus,
 };
 use shunt_infer::{InferError, InferResult, Probe, ProbeCtx, ProbeResult, ToolProvider, ToolSpec};
 use shunt_localize::{Localizer, SemanticLocalizer};
-use serde_json::json;
 
 // ── Manifest file names recognised by ManifestProbe ──────────────────────────
 

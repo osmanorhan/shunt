@@ -111,9 +111,9 @@ impl ModelMatcher for Qwen3Matcher {
             tool_choice_mode: ToolChoiceMode::JsonSchema,
             max_tokens: 32768,
             supports_thinking: true,
-            disable_thinking: true,       // /no_think on action-selection calls only
+            disable_thinking: true, // /no_think on action-selection calls only
             thinking_budget_tokens: Some(512), // ~51s at 10 tok/s; 2048 exceeds 180s timeout
-            temperature: 0.7,             // non-thinking instruct mode for routing
+            temperature: 0.7,       // non-thinking instruct mode for routing
             content_temperature: Some(0.6), // thinking/precise-coding mode for code gen
             top_p: Some(0.8),
             top_k: Some(20),
@@ -154,7 +154,7 @@ impl ModelMatcher for Gemma4Matcher {
             disable_thinking: false,
             thinking_budget_tokens: Some(2048),
             temperature: 1.0,
-            content_temperature: None,    // same 1.0 for content
+            content_temperature: None, // same 1.0 for content
             top_p: Some(0.95),
             top_k: Some(64),
             min_p: None,

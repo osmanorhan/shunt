@@ -143,7 +143,10 @@ mod tests {
             main.contains("greet_user")
         );
         assert!(lib.contains("fn greet_user"), "lib.rs not renamed:\n{lib}");
-        assert!(main.contains("greet_user"), "main.rs caller not updated:\n{main}");
+        assert!(
+            main.contains("greet_user"),
+            "main.rs caller not updated:\n{main}"
+        );
     }
 
     /// FRONTIER (interactive): drive the *approval gate* — `agentic()` policy makes
@@ -171,6 +174,9 @@ mod tests {
             "expected a ChangeProposed notification before approval"
         );
         let cfg = read_file(&workspace, "src/config.ts");
-        assert!(cfg.contains("30000"), "timeout not updated after approval:\n{cfg}");
+        assert!(
+            cfg.contains("30000"),
+            "timeout not updated after approval:\n{cfg}"
+        );
     }
 }

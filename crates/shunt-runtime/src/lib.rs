@@ -4245,8 +4245,7 @@ mod tests {
             .as_ref()
             .expect("change_set should be set");
         assert_eq!(cs.ops.len(), 1);
-        let FileOp::Create { path, contents } = &cs.ops[0]
-        else {
+        let FileOp::Create { path, contents } = &cs.ops[0] else {
             panic!("expected Create op");
         };
         assert_eq!(path, "src/lib.rs");
@@ -4255,7 +4254,6 @@ mod tests {
 
         fs::remove_dir_all(root).unwrap();
     }
-
 
     fn unique_temp_dir(prefix: &str) -> PathBuf {
         std::env::temp_dir().join(format!(

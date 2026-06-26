@@ -38,12 +38,21 @@ pub fn run_catalog_filtered(
     task_name: Option<&str>,
 ) -> Vec<ModelScorecard> {
     let all = suite();
-    let tasks: Vec<CapabilityTask> = all.into_iter()
+    let tasks: Vec<CapabilityTask> = all
+        .into_iter()
         .filter(|t| {
-            if let Some(name) = task_name { t.name == name } else { true }
+            if let Some(name) = task_name {
+                t.name == name
+            } else {
+                true
+            }
         })
         .filter(|t| {
-            if let Some(min) = min_difficulty { t.difficulty >= min } else { true }
+            if let Some(min) = min_difficulty {
+                t.difficulty >= min
+            } else {
+                true
+            }
         })
         .collect();
     let tasks = std::sync::Arc::new(tasks);
@@ -65,7 +74,12 @@ pub fn run_catalog_filtered(
 
 /// Run one model through the suite. Unreachable endpoints are skipped (not failed).
 pub fn run_model(spec: &ModelSpec, tasks: &[CapabilityTask], runs: usize) -> ModelScorecard {
-    let header = format!("{} [{}] @ {}", spec.name, spec.engine.label(), spec.endpoint);
+    let header = format!(
+        "{} [{}] @ {}",
+        spec.name,
+        spec.engine.label(),
+        spec.endpoint
+    );
     if !reachable(&spec.endpoint) {
         eprintln!("• {header}: UNREACHABLE — skipped");
         return ModelScorecard {
@@ -111,7 +125,13 @@ struct RunPayload {
 }
 
 /// The model-agnostic core: drive each task `runs` times and score it.
-fn run_suite<P>(model_name: &str, provider: P, tasks: &[CapabilityTask], runs: usize, call_timeout_secs: u64) -> Vec<TaskScore>
+fn run_suite<P>(
+    model_name: &str,
+    provider: P,
+    tasks: &[CapabilityTask],
+    runs: usize,
+    call_timeout_secs: u64,
+) -> Vec<TaskScore>
 where
     P: ToolProvider + Clone + Send + Sync + 'static,
 {
@@ -151,10 +171,14 @@ where
                             (rel.to_string(), content)
                         })
                         .collect();
-                    let debug_log =
-                        std::fs::read(ws.root().join(".shunt/debug.log")).ok();
+                    let debug_log = std::fs::read(ws.root().join(".shunt/debug.log")).ok();
                     let elapsed = t0.elapsed();
-                    let _ = tx.send(RunPayload { result, file_snapshots, debug_log, elapsed });
+                    let _ = tx.send(RunPayload {
+                        result,
+                        file_snapshots,
+                        debug_log,
+                        elapsed,
+                    });
                     // ws drops here — TempDir cleaned up
                 });
 
@@ -177,14 +201,25 @@ where
                             name: task.name.to_string(),
                             final_state: TaskState::Stopped {
                                 reason: StopReason::Failed {
-                                    reason: format!("benchmark per-run timeout ({}s)", per_run_timeout.as_secs()),
+                                    reason: format!(
+                                        "benchmark per-run timeout ({}s)",
+                                        per_run_timeout.as_secs()
+                                    ),
                                 },
                             },
                             notifications: Vec::new(),
                             total: per_run_timeout,
                             index_warm: None,
                         };
-                        write_run_log(model_name, task, run_idx + 1, Outcome::NotCompleted, &timeout_result, &[], None);
+                        write_run_log(
+                            model_name,
+                            task,
+                            run_idx + 1,
+                            Outcome::NotCompleted,
+                            &timeout_result,
+                            &[],
+                            None,
+                        );
                         metrics.push(RunMetrics {
                             outcome: Outcome::NotCompleted,
                             tool_calls: 0,
@@ -196,7 +231,15 @@ where
 
                 eprint!("{}", outcome.glyph());
                 if let Some(p) = payload {
-                    write_run_log(model_name, task, run_idx + 1, outcome, &p.result, &p.file_snapshots, p.debug_log.as_deref());
+                    write_run_log(
+                        model_name,
+                        task,
+                        run_idx + 1,
+                        outcome,
+                        &p.result,
+                        &p.file_snapshots,
+                        p.debug_log.as_deref(),
+                    );
                     metrics.push(RunMetrics {
                         outcome,
                         tool_calls: p.result.agent_tool_calls(),
@@ -241,7 +284,10 @@ fn write_run_log(
 ) {
     let dir = Path::new("capability-logs").join(safe_name(model_name));
     if let Err(e) = std::fs::create_dir_all(&dir) {
-        eprintln!("(could not create capability log dir {}: {e})", dir.display());
+        eprintln!(
+            "(could not create capability log dir {}: {e})",
+            dir.display()
+        );
         return;
     }
 
@@ -250,13 +296,19 @@ fn write_run_log(
     let debug_path = dir.join(format!("{stem}.debug.log"));
 
     let mut log = String::new();
-    log.push_str(&format!("# {} / {} / run {}\n\n", model_name, task.name, run_idx));
+    log.push_str(&format!(
+        "# {} / {} / run {}\n\n",
+        model_name, task.name, run_idx
+    ));
     log.push_str(&format!("- difficulty: {}\n", task.difficulty.label()));
     log.push_str(&format!("- outcome: {:?} `{}`\n", outcome, outcome.glyph()));
     log.push_str(&format!("- final_state: `{:?}`\n", result.final_state));
     log.push_str(&format!("- elapsed_ms: {}\n", result.total.as_millis()));
     log.push_str(&format!("- tool_calls: {}\n", result.agent_tool_calls()));
-    log.push_str(&format!("- change_proposed: {}\n", result.change_proposed()));
+    log.push_str(&format!(
+        "- change_proposed: {}\n",
+        result.change_proposed()
+    ));
     if let Some(reason) = result.stop_reason() {
         log.push_str(&format!("- stop_reason: `{reason}`\n"));
     }
@@ -279,7 +331,10 @@ fn write_run_log(
     }
 
     if let Err(e) = std::fs::write(&md_path, log) {
-        eprintln!("(could not write capability log {}: {e})", md_path.display());
+        eprintln!(
+            "(could not write capability log {}: {e})",
+            md_path.display()
+        );
     }
 
     if let Some(bytes) = debug_bytes
@@ -291,7 +346,13 @@ fn write_run_log(
 
 fn safe_name(name: &str) -> String {
     name.chars()
-        .map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' { c } else { '-' })
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '-'
+            }
+        })
         .collect()
 }
 

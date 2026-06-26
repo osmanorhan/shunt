@@ -3,14 +3,14 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+use reqwest::blocking::Client;
+use semver::{Version, VersionReq};
+use serde::Deserialize;
 use shunt_core::{
     Ambiguity, EvidenceKind, EvidenceRef, ManualEvidence, ManualQuery, ManualVersionStatus,
     PackageFact, PackageVersionProvenance, UnderstandingArtifact,
 };
 use shunt_localize::ContextPacket;
-use reqwest::blocking::Client;
-use semver::{Version, VersionReq};
-use serde::Deserialize;
 use thiserror::Error;
 
 const DEFAULT_CATALOG_PATH: &str = ".shunt/manuals/catalog.json";

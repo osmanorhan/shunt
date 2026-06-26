@@ -88,7 +88,9 @@ pub fn suite() -> Vec<CapabilityTask> {
                  export function loadConfig(): Cfg {\n  \
                  return { timeoutMs: parseInt(process.env.TIMEOUT_MS ?? '5000', 10) };\n}\n",
             )],
-            checks: &[("src/config.ts", |c| c.contains("30000") && !c.contains("5000"))],
+            checks: &[("src/config.ts", |c| {
+                c.contains("30000") && !c.contains("5000")
+            })],
         },
         // T2: add a self-contained function. Tests content generation.
         CapabilityTask {
@@ -101,7 +103,9 @@ pub fn suite() -> Vec<CapabilityTask> {
                 "/// Greet a user by name.\npub fn greet(name: &str) -> String {\n    \
                  format!(\"Hello, {name}!\")\n}\n",
             )],
-            checks: &[("src/lib.rs", |c| c.contains("fn farewell") && c.contains("greet"))],
+            checks: &[("src/lib.rs", |c| {
+                c.contains("fn farewell") && c.contains("greet")
+            })],
         },
         // T3: fix a bug on a SPECIFIC line among look-alikes in a moderate file.
         // Tests positioning + discrimination (two identical `return value;` lines).
@@ -120,10 +124,9 @@ pub fn suite() -> Vec<CapabilityTask> {
             )],
             // The value>max branch must now return max (not value). Cheap proxy:
             // the file references `max` in a return and still has clamp intact.
-            checks: &[(
-                "src/util.ts",
-                |c| c.contains("return max") && c.contains("function clamp"),
-            )],
+            checks: &[("src/util.ts", |c| {
+                c.contains("return max") && c.contains("function clamp")
+            })],
         },
         // T4: two-site change (rename a symbol used in two files). Tests
         // convergence across multiple edits without thrashing.
@@ -143,8 +146,12 @@ pub fn suite() -> Vec<CapabilityTask> {
                 ),
             ],
             checks: &[
-                ("src/lib.rs", |c| c.contains("fn greet_user") && !c.contains("fn greet(")),
-                ("src/main.rs", |c| c.contains("greet_user") && !c.contains("greet(")),
+                ("src/lib.rs", |c| {
+                    c.contains("fn greet_user") && !c.contains("fn greet(")
+                }),
+                ("src/main.rs", |c| {
+                    c.contains("greet_user") && !c.contains("greet(")
+                }),
             ],
         },
         // T5: add a branch in the right order. Tests small control-flow insertion
@@ -163,7 +170,12 @@ pub fn suite() -> Vec<CapabilityTask> {
             checks: &[(
                 "src/status.ts",
                 // prettier may convert single→double quotes; check content not quote style
-                |c| c.contains("user.locked") && c.contains("return") && c.contains("locked") && c.contains("disabled"),
+                |c| {
+                    c.contains("user.locked")
+                        && c.contains("return")
+                        && c.contains("locked")
+                        && c.contains("disabled")
+                },
             )],
         },
         // T6: remove a legacy branch while preserving the remaining cases.
@@ -202,8 +214,12 @@ pub fn suite() -> Vec<CapabilityTask> {
                 ),
             ],
             checks: &[
-                ("src/math.ts", |c| c.contains("function addNumbers") && !c.contains("function sum")),
-                ("src/report.ts", |c| c.contains("addNumbers") && !c.contains("sum(")),
+                ("src/math.ts", |c| {
+                    c.contains("function addNumbers") && !c.contains("function sum")
+                }),
+                ("src/report.ts", |c| {
+                    c.contains("addNumbers") && !c.contains("sum(")
+                }),
             ],
         },
         // T8: thread a new config field through construction and use sites.
@@ -221,13 +237,12 @@ pub fn suite() -> Vec<CapabilityTask> {
                  pub struct Client;\n\n\
                  fn connect_with_timeout(_timeout_ms: u64) -> Client {\n    Client\n}\n",
             )],
-            checks: &[(
-                "src/client.rs",
-                |c| c.contains("retry_count: usize")
+            checks: &[("src/client.rs", |c| {
+                c.contains("retry_count: usize")
                     && c.contains("retry_count: 3")
                     && c.contains("cfg.retry_count")
-                    && c.contains("connect_with_timeout"),
-            )],
+                    && c.contains("connect_with_timeout")
+            })],
         },
         // T9: change production behavior and keep the test expectation in sync.
         CapabilityTask {
@@ -245,8 +260,12 @@ pub fn suite() -> Vec<CapabilityTask> {
                 ),
             ],
             checks: &[
-                ("src/pricing.ts", |c| (c.contains("1.10") || c.contains("1.1")) && !c.contains("1.08")),
-                ("tests/pricing.test.ts", |c| c.contains("110") && !c.contains("108")),
+                ("src/pricing.ts", |c| {
+                    (c.contains("1.10") || c.contains("1.1")) && !c.contains("1.08")
+                }),
+                ("tests/pricing.test.ts", |c| {
+                    c.contains("110") && !c.contains("108")
+                }),
             ],
         },
         // T10: move error handling to the caller instead of swallowing failures in
@@ -267,10 +286,12 @@ pub fn suite() -> Vec<CapabilityTask> {
             checks: &[(
                 "src/users.ts",
                 // prettier may convert single→double quotes; check content not quote style
-                |c| !c.contains("return null")
-                    && c.contains("catch")
-                    && c.contains("unavailable")
-                    && c.contains("missing"),
+                |c| {
+                    !c.contains("return null")
+                        && c.contains("catch")
+                        && c.contains("unavailable")
+                        && c.contains("missing")
+                },
             )],
         },
     ]

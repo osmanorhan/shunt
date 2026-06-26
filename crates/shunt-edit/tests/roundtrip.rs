@@ -59,8 +59,16 @@ fn every_line_number_round_trips() {
         )
         .unwrap();
         let out_lines: Vec<&str> = out.trim_end_matches('\n').split('\n').collect();
-        assert_eq!(out_lines[line_no - 1], marker, "line {line_no} should be edited");
-        assert_eq!(out_lines.len(), n, "line count unchanged for single-line replace");
+        assert_eq!(
+            out_lines[line_no - 1],
+            marker,
+            "line {line_no} should be edited"
+        );
+        assert_eq!(
+            out_lines.len(),
+            n,
+            "line count unchanged for single-line replace"
+        );
     }
 }
 

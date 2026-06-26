@@ -17,13 +17,13 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
+use serde_json::Value;
 use shunt_infer::engine::{EngineKind, detect_engine};
 use shunt_infer::{
     AgentObserver, AgentResult, AgentSession, InferResult, OllamaProvider, OpenAiCompatProvider,
     ProposedFileOp, ProviderCapabilities, SourceFileContext, ToolCall, ToolChoiceMode,
     ToolProvider, ToolSpec,
 };
-use serde_json::Value;
 use tempfile::TempDir;
 
 // ── Workspace ────────────────────────────────────────────────────────────────

@@ -12,6 +12,13 @@ use crossterm::execute;
 use crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
 };
+use ratatui::Terminal;
+use ratatui::backend::CrosstermBackend;
+use ratatui::layout::{Constraint, Direction, Layout};
+use ratatui::style::{Color, Style};
+use ratatui::text::{Line, Span, Text};
+use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
+use serde::{Deserialize, Serialize};
 use shunt_core::machine::{
     ArtifactSnapshot, AutonomyPolicy, Command as MachineCommand, Notification, TaskState,
     UserRequest,
@@ -24,13 +31,6 @@ use shunt_infer::{OpenAiCompatProvider, ProviderCapabilities, SessionBudgetOverr
 use shunt_runtime::session::{SessionHandle, spawn_session};
 use shunt_runtime::{ArtifactUpdate, TaskRuntime};
 use shunt_store::{SqliteStore, StoreError};
-use ratatui::Terminal;
-use ratatui::backend::CrosstermBackend;
-use ratatui::layout::{Constraint, Direction, Layout};
-use ratatui::style::{Color, Style};
-use ratatui::text::{Line, Span, Text};
-use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
-use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use time::OffsetDateTime;
 use tokio::sync::broadcast;
@@ -381,7 +381,6 @@ impl AppContext {
             version: self.config.recipe_version.clone(),
         }
     }
-
 
     fn init_config(&self, force: bool) -> Result<(), CliError> {
         if self.config_path.exists() && !force {

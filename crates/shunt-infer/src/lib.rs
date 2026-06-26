@@ -7,13 +7,13 @@ pub use agent::{
     SessionBudgetOverride,
 };
 
+use reqwest::blocking::Client;
+use schemars::JsonSchema;
+use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use shunt_core::{
     Ambiguity, AmbiguityKind, AmbiguityStatus, EvidenceRef, ManualEvidence, ManualVersionStatus,
     PackageFact, Risk, RiskSeverity, UnderstandingArtifact, VerifierOutcome, VerifierStatus,
 };
-use reqwest::blocking::Client;
-use schemars::JsonSchema;
-use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use std::path::Path;
 use std::sync::{
     Arc,
@@ -638,13 +638,13 @@ impl OpenAiCompatProvider {
         req: &ChatCompletionRequest,
     ) -> InferResult<T> {
         let body = serde_json::to_vec(req).map_err(InferError::Json)?;
-        tracing::debug!(
-            "── request body ──\n{}",
-            String::from_utf8_lossy(&body)
-        );
+        tracing::debug!("── request body ──\n{}", String::from_utf8_lossy(&body));
         let client = self.client.clone();
         let deadline = self.call_timeout;
-        let url = format!("{}/v1/chat/completions", self.endpoint.trim_end_matches('/'));
+        let url = format!(
+            "{}/v1/chat/completions",
+            self.endpoint.trim_end_matches('/')
+        );
         let (tx, rx) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
             // Per-request timeout = the deadline, so a timed-out request is
@@ -683,18 +683,19 @@ impl OpenAiCompatProvider {
             user.len(),
             user
         );
-        let content_temp = self.capabilities.content_temperature
+        let content_temp = self
+            .capabilities
+            .content_temperature
             .unwrap_or(self.capabilities.temperature);
         // For models where suppress_content_thinking=true (Qwen3), also prepend /no_think
         // so the model skips reasoning even if the server's chat_template_kwargs isn't
         // sufficient on its own.
-        let user_content = if self.capabilities.suppress_content_thinking
-            && self.capabilities.disable_thinking
-        {
-            format!("/no_think\n{user}")
-        } else {
-            user.to_owned()
-        };
+        let user_content =
+            if self.capabilities.suppress_content_thinking && self.capabilities.disable_thinking {
+                format!("/no_think\n{user}")
+            } else {
+                user.to_owned()
+            };
         let req = ChatCompletionRequest {
             model: self.model.clone(),
             messages: vec![
@@ -900,7 +901,11 @@ impl ToolProvider for OpenAiCompatProvider {
             call_id,
             tool: tool.name.clone(),
             model: self.model.clone(),
-            mode: format!("{:?}+history({})", self.capabilities.tool_choice_mode, messages.len()),
+            mode: format!(
+                "{:?}+history({})",
+                self.capabilities.tool_choice_mode,
+                messages.len()
+            ),
         });
 
         let mut req = self.request_from_messages(messages, tool);

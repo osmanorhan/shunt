@@ -7,8 +7,8 @@
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 
-use shunt_infer::{InferError, InferResult, ToolCall, ToolProvider, ToolSpec};
 use serde_json::Value;
+use shunt_infer::{InferError, InferResult, ToolCall, ToolProvider, ToolSpec};
 
 #[derive(Debug, Clone)]
 pub struct Call {

@@ -28,7 +28,11 @@ mod tests {
         if let Some(rest) = t.strip_prefix("```") {
             // drop the optional language tag on the first line, and the closing fence
             let body = rest.split_once('\n').map(|(_, body)| body).unwrap_or("");
-            return body.trim_end().trim_end_matches("```").trim_end().to_string();
+            return body
+                .trim_end()
+                .trim_end_matches("```")
+                .trim_end()
+                .to_string();
         }
         t.to_string()
     }
@@ -116,11 +120,15 @@ export function isEven(n: number): boolean {
             "properties": { "start": { "type": "integer" }, "end": { "type": "integer" } },
             "required": ["start", "end"]
         });
-        let range: LineRange =
-            match provider.generate_structured_named("line_range", range_system, &range_user, &range_schema) {
-                Ok(r) => r,
-                Err(err) => panic!("model failed to choose a line range: {err}"),
-            };
+        let range: LineRange = match provider.generate_structured_named(
+            "line_range",
+            range_system,
+            &range_user,
+            &range_schema,
+        ) {
+            Ok(r) => r,
+            Err(err) => panic!("model failed to choose a line range: {err}"),
+        };
         println!("STEP 1 — model chose lines {}-{}", range.start, range.end);
 
         // STEP 2 — content (call_text): the replacement for just those lines. This is
