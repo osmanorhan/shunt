@@ -1,11 +1,12 @@
 source "https://rubygems.org"
 
-gem "github-pages", group: :jekyll_plugins
-gem "jekyll-remote-theme"
-gem "jekyll-seo-tag"
+gem "github-pages", "~> 232", group: :jekyll_plugins
 
 # Ruby 3.3+ no longer exposes some bundled/default gems unless they are
 # declared, but older GitHub Pages dependencies still require them directly.
 gem "base64"
 gem "bigdecimal"
+gem "csv"
+gem "faraday-retry"
+gem "logger"
 gem "rexml"
