@@ -26,16 +26,23 @@ shunt runs a tool-use agent loop against a local LLM server. It indexes your wor
 
 ## Install
 
+**Linux / macOS**
+
 ```sh
-curl -fsSL https://raw.githubusercontent.com/osmanorhan/shunt/main/scripts/install.sh | sh
+curl --proto '=https' --tlsv1.2 -LsSf https://github.com/osmanorhan/shunt/releases/latest/download/shunt-cli-installer.sh | sh
 ```
 
-Installs to `~/.local/bin/shunt`.
+**Windows** (PowerShell)
+
+```powershell
+powershell -ExecutionPolicy ByPass -c "irm https://github.com/osmanorhan/shunt/releases/latest/download/shunt-cli-installer.ps1 | iex"
+```
 
 | Platform | Architecture |
 |----------|-------------|
-| Linux | x86_64, aarch64 (statically linked) |
-| macOS | Apple Silicon, Intel |
+| Linux    | x86_64, aarch64 |
+| macOS    | Apple Silicon, Intel |
+| Windows  | x86_64 |
 
 ---
 

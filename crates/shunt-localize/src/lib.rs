@@ -406,7 +406,7 @@ impl Retriever for LexicalRetriever {
         builder.standard_filters(true);
         builder.git_ignore(true);
         builder.git_exclude(true);
-        builder.hidden(false);
+        builder.hidden(true);
         builder.build_parallel().run(|| {
             let files = Arc::clone(&files);
             let query = Arc::clone(&query);

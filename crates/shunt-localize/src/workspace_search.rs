@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use ignore::WalkBuilder;
 
@@ -8,6 +8,24 @@ pub struct WorkspaceSearch {
 
 /// Don't read files larger than this for content matching (skip blobs/minified).
 const MAX_CONTENT_BYTES: u64 = 2_000_000;
+
+const EXCLUDED_DIRS: &[&str] = &[
+    "node_modules",
+    "target",
+    "dist",
+    "build",
+    "__pycache__",
+    ".venv",
+    "venv",
+    ".tox",
+    ".eggs",
+];
+
+fn is_excluded(path: &Path) -> bool {
+    path.components().any(|c| {
+        matches!(c.as_os_str().to_str(), Some(name) if EXCLUDED_DIRS.contains(&name))
+    })
+}
 /// Cap returned files so a broad query can't flood the agent's context.
 const MAX_HITS: usize = 50;
 
@@ -39,7 +57,7 @@ impl WorkspaceSearch {
                 break;
             }
             let path = entry.path();
-            if !path.is_file() {
+            if !path.is_file() || is_excluded(path) {
                 continue;
             }
             let Ok(rel) = path.strip_prefix(&self.root) else {
@@ -75,7 +93,7 @@ impl WorkspaceSearch {
         let walker = WalkBuilder::new(&self.root).hidden(true).build();
         let mut files: Vec<String> = walker
             .flatten()
-            .filter(|e| e.path().is_file())
+            .filter(|e| e.path().is_file() && !is_excluded(e.path()))
             .filter_map(|e| {
                 e.path()
                     .strip_prefix(&self.root)
@@ -94,7 +112,7 @@ impl WorkspaceSearch {
         let mut hits = Vec::new();
         for entry in walker.flatten() {
             let path = entry.path();
-            if !path.is_file() {
+            if !path.is_file() || is_excluded(path) {
                 continue;
             }
             let rel = match path.strip_prefix(&self.root) {

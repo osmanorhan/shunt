@@ -53,7 +53,7 @@ impl WorkspaceIngestor {
             return Err(SearchError::InvalidRoot(root.to_path_buf()));
         }
 
-        let files = crawl_files(root, &self.crawl);
+        let files = crawl_files(root, &self.crawl)?;
         let mut chunks = Vec::new();
         let mut next_id: ChunkId = 1;
         let mut files_parsed = 0;
@@ -94,7 +94,7 @@ impl WorkspaceIngestor {
             return Err(SearchError::InvalidRoot(root.to_path_buf()));
         }
 
-        let files = crawl_files(root, &self.crawl);
+        let files = crawl_files(root, &self.crawl)?;
         let seen_paths = files.iter().cloned().collect::<HashSet<_>>();
         let mut files_changed = 0;
         let mut files_removed = 0;

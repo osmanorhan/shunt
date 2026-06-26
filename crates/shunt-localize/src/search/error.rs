@@ -12,6 +12,7 @@ pub enum SearchError {
     ManifestFormat { path: PathBuf, message: String },
     ParserUnavailable(String),
     SnapshotFormat { path: PathBuf, message: String },
+    TooManyFiles { root: PathBuf, limit: usize },
 }
 
 impl Display for SearchError {
@@ -24,6 +25,11 @@ impl Display for SearchError {
             Self::ManifestFormat { path, message } => write!(f, "{}: {message}", path.display()),
             Self::ParserUnavailable(language) => write!(f, "parser unavailable for {language}"),
             Self::SnapshotFormat { path, message } => write!(f, "{}: {message}", path.display()),
+            Self::TooManyFiles { root, limit } => write!(
+                f,
+                "{} contains more than {limit} source files — run shunt from a project subdirectory, not a large root like your home directory",
+                root.display()
+            ),
         }
     }
 }

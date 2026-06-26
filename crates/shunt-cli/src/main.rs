@@ -667,12 +667,27 @@ fn main() -> Result<(), CliError> {
     Ok(())
 }
 
+fn is_home_directory(path: &Path) -> bool {
+    std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .and_then(|home| home.canonicalize().ok())
+        .is_some_and(|home| home == path)
+}
+
 fn load_context(
     cwd_override: Option<PathBuf>,
     config_override: Option<PathBuf>,
     auto_create_config: bool,
 ) -> Result<AppContext, CliError> {
     let workspace_root = canonicalize_or_current(cwd_override)?;
+
+    if is_home_directory(&workspace_root) {
+        return Err(CliError::Terminal(
+            "refusing to use your home directory as the workspace — \
+             cd into a project directory first, or pass --cwd <project-path>"
+                .into(),
+        ));
+    }
     let has_explicit_config = config_override.is_some();
     let config_path = config_override
         .map(|path| resolve_path(&workspace_root, &path))

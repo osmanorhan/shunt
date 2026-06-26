@@ -4,7 +4,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
-const LAYOUT_VERSION: u32 = 1;
+const LAYOUT_VERSION: u32 = 2;
 const SNAPSHOT_FILENAME: &str = "engine.snapshot.json";
 const MANIFEST_FILENAME: &str = "manifest.json";
 
