@@ -1,14 +1,15 @@
 # shunt
 
-A coding agent built and tested against local language models.
+A coding agent built for local language models.
 
-Local models work differently from cloud models. Context windows are smaller, tool use is less reliable, and models built for reasoning can exhaust their token budget before writing a single line of output. Running an agent built for GPT-4 against a local 14B model will expose all of these gaps.
+shunt is designed around the limits of local models instead of assuming cloud-model behavior.
 
-Local models have small context windows and source files are long. If the agent reads the wrong files, or reads full files when only a few lines matter, it burns through context and turns before it gets to the actual work. shunt builds a workspace index combining lexical search with tree-sitter code structure, detects what kind of change is being asked for, and gives the model the relevant snippets ranked by role rather than full file dumps. This keeps context spend low and leaves room for the actual edit.
-
-Grammar-constrained decoding forces valid tool call output on every turn regardless of model size. The model registry detects which model is running and applies the right configuration for that family, including how to handle thinking budgets on reasoning models.
-
-shunt is developed and benchmarked exclusively against local models. Every part of the agent loop is built around the failure points those models actually have.
+* **Uses less context** — indexes your workspace and gives the model relevant snippets instead of dumping full files.
+* **Finds better edit targets** — combines lexical search with tree-sitter code structure to rank files and symbols by relevance.
+* **Handles smaller models reliably** — uses grammar-constrained decoding so tool calls stay valid even on local 9B–14B models.
+* **Works with reasoning models** — manages thinking budgets so models do not burn all tokens before producing an answer or edit.
+* **Adapts to model families** — detects the configured model and applies the right settings for Gemma, Qwen, and other supported local models.
+* **Built for local-first workflows** — developed and benchmarked against local inference servers, not cloud APIs.
 
 ---
 
@@ -18,17 +19,24 @@ shunt is developed and benchmarked exclusively against local models. Every part 
 curl -fsSL https://raw.githubusercontent.com/osmanorhan/shunt/main/scripts/install.sh | sh
 ```
 
-Installs to `~/.local/bin/shunt`. Override with `SHUNT_INSTALL_DIR=/usr/local/bin`.
+Installs to `~/.local/bin/shunt`.
 
-To install a specific version:
+To install somewhere else:
+
 ```sh
-SHUNT_VERSION=v0.2.0 curl -fsSL .../install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/osmanorhan/shunt/main/scripts/install.sh | SHUNT_INSTALL_DIR=/usr/local/bin sh
 ```
 
-| Platform | Architecture |
-|----------|-------------|
-| Linux | x86_64, aarch64 (statically linked) |
-| macOS | Apple Silicon, Intel |
+To install a specific version:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/osmanorhan/shunt/main/scripts/install.sh | SHUNT_VERSION=v0.2.0 sh
+```
+
+| Platform | Architecture         |
+| -------- | -------------------- |
+| Linux    | x86_64, aarch64      |
+| macOS    | Apple Silicon, Intel |
 
 ---
 
@@ -44,29 +52,40 @@ A local LLM server with an OpenAI-compatible API:
 
 ## Recommended models
 
-### Gemma 4 (Google)
+### Gemma 4
 
-| Model | Quant | VRAM |
-|-------|-------|------|
-| `gemma-4-12b-it` | UD-Q4_K_XL | ~8 GB |
-| `gemma-4-26B-A4B-it` | UD-Q4_K_M | ~17 GB |
+| Model                | Quant      | VRAM   |
+| -------------------- | ---------- | ------ |
+| `gemma-4-12b-it`     | UD-Q4_K_XL | ~8 GB  |
+| `gemma-4-26B-A4B-it` | UD-Q4_K_M  | ~17 GB |
 
 ```sh
 # 12B
 llama-server -hf unsloth/gemma-4-12b-it-GGUF:UD-Q4_K_XL \
-  --jinja -ngl 999 -fa -c 8192
+  --jinja -ngl 999 -fa on
 
-# 26B-A4B (MoE — larger but only 4B active parameters)
+# 26B-A4B
 llama-server -hf unsloth/gemma-4-26B-A4B-it-GGUF:UD-Q4_K_M \
-  --jinja -ngl 999 -fa -c 8192
+  --jinja -ngl 999 -fa on
 ```
 
 ```toml
 endpoint = "http://localhost:8080"
-model    = "gemma-4-12b"
+model    = "gemma-4-12b-it"
 ```
 
-### Qwen (Alibaba)
+### Qwen
+
+| Model             | Quant      | VRAM    |
+| ----------------- | ---------- | ------- |
+| `Qwen3.5-9B`      | UD-Q4_K_XL | ~6.5 GB |
+| `Qwen3.6-27B`     | Q4_K_S     | ~16 GB  |
+| `Qwen3.6-35B-A3B` | UD-Q4_K_M  | ~22 GB  |
+
+The 35B-A3B model is a mixture-of-experts model: 35B total parameters, with 3B active per forward pass.
+
+
+### Qwen
 
 | Model | Quant | VRAM |
 |-------|-------|------|
@@ -79,15 +98,15 @@ The 35B-A3B is a mixture-of-experts model — 35B total parameters, 3B active pe
 ```sh
 # Qwen3.5-9B (~6.5 GB)
 llama-server -hf unsloth/Qwen3.5-9B-GGUF:UD-Q4_K_XL \
-  --jinja -ngl 999 -fa -c 8192
+  --jinja -ngl 999 -fa on
 
 # Qwen3.6-27B (~16 GB)
 llama-server -hf unsloth/Qwen3.6-27B-GGUF:Q4_K_S \
-  --jinja -ngl 999 -fa -c 8192
+  --jinja -ngl 999 -fa on
 
 # Qwen3.6-35B-A3B MoE (~22 GB)
 llama-server -hf unsloth/Qwen3.6-35B-A3B-GGUF:UD-Q4_K_M \
-  --jinja -ngl 999 -fa -c 8192
+  --jinja -ngl 999 -fa on
 ```
 
 ```toml
@@ -102,7 +121,7 @@ model    = "qwen3.6-27b"   # or qwen3.5-9b
 | `-hf <repo:quant>` | Download and run directly from Hugging Face |
 | `--jinja` | Jinja2 chat template — required for correct tool-call formatting |
 | `-ngl 999` | Offload all layers to GPU |
-| `-fa` | Flash attention — significant speedup on CUDA |
+| `-fa on` | Flash attention — significant speedup on CUDA |
 | `-c 8192` | Context window size |
 | `-sm layer` | Tensor parallel across multiple GPUs |
 
