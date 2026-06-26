@@ -18,13 +18,13 @@ shunt is designed around the limits of local models instead of assuming cloud-mo
 **Linux / macOS**
 
 ```sh
-curl --proto '=https' --tlsv1.2 -LsSf https://github.com/osmanorhan/shunt/releases/latest/download/shunt-installer.sh | sh
+curl --proto '=https' --tlsv1.2 -LsSf https://github.com/osmanorhan/shunt/releases/latest/download/shunt-cli-installer.sh | sh
 ```
 
 **Windows** (PowerShell)
 
 ```powershell
-powershell -ExecutionPolicy ByPass -c "irm https://github.com/osmanorhan/shunt/releases/latest/download/shunt-installer.ps1 | iex"
+powershell -ExecutionPolicy ByPass -c "irm https://github.com/osmanorhan/shunt/releases/latest/download/shunt-cli-installer.ps1 | iex"
 ```
 
 | Platform | Architecture         |
