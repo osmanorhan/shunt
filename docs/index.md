@@ -17,7 +17,7 @@ A coding agent built for local language models.
 shunt runs a tool-use agent loop against a local LLM server. It indexes your workspace, finds relevant files, and edits them — pausing only when it needs input from you.
 
 - **Grammar-constrained tool calls** — JSON schema grammar produces valid structured output on every turn
-- **Model registry** — auto-detects Gemma 4, Qwen 3, DeepSeek R1, Mistral and applies the right decoding strategy per family
+- **Model registry** — auto-detects Gemma 4, Qwen 3, and other supported local models and applies the right decoding strategy per family
 - **Configurable thinking budget** — per-model-family reasoning token allocation
 - **Workspace search** — hybrid lexical + semantic index over your codebase
 - **Fully local** — no telemetry, no cloud calls, no API keys
@@ -44,11 +44,9 @@ Installs to `~/.local/bin/shunt`.
 **1. Start a local model server**
 
 ```sh
-# Gemma 4 12B (~10 GB VRAM)
-llama-server \
-  --model gemma-4-12b-it-Q4_K_M.gguf \
-  --port 8080 --ctx-size 16384 \
-  --flash-attn on --jinja --reasoning off
+# Gemma 4 12B (~8 GB VRAM)
+llama-server -hf unsloth/gemma-4-12b-it-GGUF:UD-Q4_K_XL \
+  --jinja -ngl 999 -fa on
 ```
 
 **2. Configure shunt in your project**

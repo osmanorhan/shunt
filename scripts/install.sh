@@ -47,9 +47,11 @@ fi
 if [ "$SHUNT_VERSION" = "latest" ]; then
   printf 'Fetching latest release...\n'
   API_URL="https://api.github.com/repos/${SHUNT_REPO}/releases/latest"
-  SHUNT_VERSION="$(curl -fsSL "$API_URL" | grep '"tag_name"' | sed 's/.*"tag_name": *"\(v[^"]*\)".*/\1/')"
+  API_RESPONSE="$(curl -fsSL "$API_URL")"
+  SHUNT_VERSION="$(printf '%s' "$API_RESPONSE" | grep '"tag_name"' | sed 's/.*"tag_name": *"\([^"]*\)".*/\1/')"
   if [ -z "$SHUNT_VERSION" ]; then
     echo "error: could not determine latest version from GitHub API" >&2
+    echo "API response: $API_RESPONSE" >&2
     exit 1
   fi
 fi

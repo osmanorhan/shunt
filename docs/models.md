@@ -35,11 +35,11 @@ The 26B-A4B is a mixture-of-experts model — 26B total parameters, 4B active pe
 ```sh
 # 12B
 llama-server -hf unsloth/gemma-4-12b-it-GGUF:UD-Q4_K_XL \
-  --jinja -ngl 999 -fa -c 8192
+  --jinja -ngl 999 -fa on -c 8192
 
 # 26B-A4B
 llama-server -hf unsloth/gemma-4-26B-A4B-it-GGUF:UD-Q4_K_M \
-  --jinja -ngl 999 -fa -c 8192
+  --jinja -ngl 999 -fa on -c 8192
 ```
 
 ### shunt config
@@ -76,15 +76,15 @@ Three practical options covering 6.5 GB to 22 GB VRAM. The 35B-A3B is a mixture-
 ```sh
 # Qwen3.5-9B
 llama-server -hf unsloth/Qwen3.5-9B-GGUF:UD-Q4_K_XL \
-  --jinja -ngl 999 -fa -c 8192
+  --jinja -ngl 999 -fa on -c 8192
 
 # Qwen3.6-27B
 llama-server -hf unsloth/Qwen3.6-27B-GGUF:Q4_K_S \
-  --jinja -ngl 999 -fa -c 8192
+  --jinja -ngl 999 -fa on -c 8192
 
 # Qwen3.6-35B-A3B (MoE)
 llama-server -hf unsloth/Qwen3.6-35B-A3B-GGUF:UD-Q4_K_M \
-  --jinja -ngl 999 -fa -c 8192
+  --jinja -ngl 999 -fa on -c 8192
 ```
 
 ### shunt config
