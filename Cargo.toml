@@ -16,6 +16,7 @@ resolver = "2"
 edition = "2024"
 license = "MIT"
 version = "0.1.0"
+repository = "https://github.com/osmanorhan/shunt"
 
 [workspace.dependencies]
 tokio       = { version = "1", features = ["full"] }
@@ -27,3 +28,8 @@ opt-level   = 3
 lto         = "thin"
 strip       = true
 codegen-units = 1
+
+# The profile that 'dist' will build with
+[profile.dist]
+inherits = "release"
+lto = "thin"

@@ -4,6 +4,9 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
+[package.metadata.dist]
+dist = false
+
 [[bin]]
 name = "shunt-bench"
 path = "src/main.rs"

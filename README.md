@@ -15,28 +15,23 @@ shunt is designed around the limits of local models instead of assuming cloud-mo
 
 ## Install
 
+**Linux / macOS**
+
 ```sh
-curl -fsSL https://raw.githubusercontent.com/osmanorhan/shunt/main/scripts/install.sh | sh
+curl --proto '=https' --tlsv1.2 -LsSf https://github.com/osmanorhan/shunt/releases/latest/download/shunt-installer.sh | sh
 ```
 
-Installs to `~/.local/bin/shunt`.
+**Windows** (PowerShell)
 
-To install somewhere else:
-
-```sh
-curl -fsSL https://raw.githubusercontent.com/osmanorhan/shunt/main/scripts/install.sh | SHUNT_INSTALL_DIR=/usr/local/bin sh
-```
-
-To install a specific version:
-
-```sh
-curl -fsSL https://raw.githubusercontent.com/osmanorhan/shunt/main/scripts/install.sh | SHUNT_VERSION=v0.2.0 sh
+```powershell
+powershell -ExecutionPolicy ByPass -c "irm https://github.com/osmanorhan/shunt/releases/latest/download/shunt-installer.ps1 | iex"
 ```
 
 | Platform | Architecture         |
 | -------- | -------------------- |
 | Linux    | x86_64, aarch64      |
 | macOS    | Apple Silicon, Intel |
+| Windows  | x86_64               |
 
 ---
 
