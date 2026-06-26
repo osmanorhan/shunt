@@ -1,18 +1,14 @@
 # shunt
 
-A coding agent for local language models.
+A coding agent built and tested against local language models.
 
-```sh
-shunt agent "add a rate-limit middleware to the Express router"
-```
+Local models work differently from cloud models. Context windows are smaller, tool use is less reliable, and models built for reasoning can exhaust their token budget before writing a single line of output. Running an agent built for GPT-4 against a local 14B model will expose all of these gaps.
 
-shunt indexes your workspace, reads the relevant files, and edits them through a tool-use loop — pausing when it needs input from you.
+Local models have small context windows and source files are long. If the agent reads the wrong files, or reads full files when only a few lines matter, it burns through context and turns before it gets to the actual work. shunt builds a workspace index combining lexical search with tree-sitter code structure, detects what kind of change is being asked for, and gives the model the relevant snippets ranked by role rather than full file dumps. This keeps context spend low and leaves room for the actual edit.
 
-- **Grammar-constrained tool calls** — JSON schema grammar produces valid structured output on every turn
-- **Model registry** — auto-detects Gemma 4, Qwen 3, DeepSeek R1, Mistral and applies the right decoding strategy per family
-- **Configurable thinking budget** — per-model-family reasoning token allocation
-- **Workspace search** — hybrid lexical + semantic index over your codebase
-- **Fully local** — no telemetry, no cloud calls, no API keys
+Grammar-constrained decoding forces valid tool call output on every turn regardless of model size. The model registry detects which model is running and applies the right configuration for that family, including how to handle thinking budgets on reasoning models.
+
+shunt is developed and benchmarked exclusively against local models. Every part of the agent loop is built around the failure points those models actually have.
 
 ---
 
@@ -50,18 +46,19 @@ A local LLM server with an OpenAI-compatible API:
 
 ### Gemma 4 (Google)
 
-| Model | VRAM |
-|-------|------|
-| `gemma-4-12b-it` | ~10 GB |
-| `gemma-4-27b-it` | ~20 GB |
-
-Download: [unsloth/gemma-4-12b-it-qat-GGUF](https://huggingface.co/unsloth/gemma-4-12b-it-qat-GGUF)
+| Model | Quant | VRAM |
+|-------|-------|------|
+| `gemma-4-12b-it` | UD-Q4_K_XL | ~8 GB |
+| `gemma-4-26B-A4B-it` | UD-Q4_K_M | ~17 GB |
 
 ```sh
-llama-server \
-  --model gemma-4-12b-it-Q4_K_M.gguf \
-  --port 8080 --ctx-size 16384 \
-  --flash-attn on --jinja --reasoning off
+# 12B
+llama-server -hf unsloth/gemma-4-12b-it-GGUF:UD-Q4_K_XL \
+  --jinja -ngl 999 -fa -c 8192
+
+# 26B-A4B (MoE — larger but only 4B active parameters)
+llama-server -hf unsloth/gemma-4-26B-A4B-it-GGUF:UD-Q4_K_M \
+  --jinja -ngl 999 -fa -c 8192
 ```
 
 ```toml
@@ -69,37 +66,45 @@ endpoint = "http://localhost:8080"
 model    = "gemma-4-12b"
 ```
 
-### Qwen 3.6 (Alibaba)
+### Qwen (Alibaba)
 
-| Model | VRAM |
-|-------|------|
-| `Qwen3.6-7B` | ~6 GB |
-| `Qwen3.6-27B` | ~18 GB |
+| Model | Quant | VRAM |
+|-------|-------|------|
+| `Qwen3.5-9B` | UD-Q4_K_XL | ~6.5 GB |
+| `Qwen3.6-27B` | Q4_K_S | ~16 GB |
+| `Qwen3.6-35B-A3B` | UD-Q4_K_M | ~22 GB |
 
-Download: [unsloth/Qwen3.6-27B-GGUF](https://huggingface.co/unsloth/Qwen3.6-27B-GGUF)
+The 35B-A3B is a mixture-of-experts model — 35B total parameters, 3B active per forward pass.
 
 ```sh
-llama-server \
-  --model Qwen3.6-27B-Q4_K_M.gguf \
-  --port 8080 --ctx-size 16384 \
-  --flash-attn on --jinja \
-  -sm layer   # spans two GPUs; omit for single card
+# Qwen3.5-9B (~6.5 GB)
+llama-server -hf unsloth/Qwen3.5-9B-GGUF:UD-Q4_K_XL \
+  --jinja -ngl 999 -fa -c 8192
+
+# Qwen3.6-27B (~16 GB)
+llama-server -hf unsloth/Qwen3.6-27B-GGUF:Q4_K_S \
+  --jinja -ngl 999 -fa -c 8192
+
+# Qwen3.6-35B-A3B MoE (~22 GB)
+llama-server -hf unsloth/Qwen3.6-35B-A3B-GGUF:UD-Q4_K_M \
+  --jinja -ngl 999 -fa -c 8192
 ```
 
 ```toml
 endpoint = "http://localhost:8080"
-model    = "qwen3.6-27b"
+model    = "qwen3.6-27b"   # or qwen3.5-9b
 ```
 
 ### Key server flags
 
 | Flag | Purpose |
 |------|---------|
-| `--jinja` | Jinja2 chat template — required for tool-call formatting |
-| `--reasoning off` | Disable server-side reasoning tokens (Gemma-4) |
-| `--flash-attn on` | Flash attention — significant speedup on CUDA |
-| `--ctx-size 16384` | Context window; 16K covers most tasks |
-| `--spec-type draft-mtp --spec-draft-n-max 2` | Multi-token prediction: 1.4–2.2× speedup (Qwen3) |
+| `-hf <repo:quant>` | Download and run directly from Hugging Face |
+| `--jinja` | Jinja2 chat template — required for correct tool-call formatting |
+| `-ngl 999` | Offload all layers to GPU |
+| `-fa` | Flash attention — significant speedup on CUDA |
+| `-c 8192` | Context window size |
+| `-sm layer` | Tensor parallel across multiple GPUs |
 
 ---
 
@@ -156,7 +161,7 @@ The workspace index (`.shunt/index/`) is built on first run and updated incremen
 
 ```toml
 endpoint = "http://localhost:8080"
-model    = "gemma4-12b"
+model    = "gemma-4-12b"
 
 [agent]
 max_turns       = 24

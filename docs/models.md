@@ -21,25 +21,25 @@ shunt auto-detects the loaded model from the server's `/v1/models` response and 
 
 ## Gemma 4 (Google)
 
-**Recommended default.** The 12B QAT variant runs on ~10 GB VRAM.
+**Recommended default.** The 12B variant runs on ~8 GB VRAM.
 
-| Model | VRAM |
-|-------|------|
-| `gemma-4-12b-it` | ~10 GB |
-| `gemma-4-27b-it` | ~20 GB |
+| Model | Quant | VRAM |
+|-------|-------|------|
+| `gemma-4-12b-it` | UD-Q4_K_XL | ~8 GB |
+| `gemma-4-26B-A4B-it` | UD-Q4_K_M | ~17 GB |
 
-Download: [unsloth/gemma-4-12b-it-qat-GGUF](https://huggingface.co/unsloth/gemma-4-12b-it-qat-GGUF)
+The 26B-A4B is a mixture-of-experts model — 26B total parameters, 4B active per forward pass.
 
 ### Server command
 
 ```sh
-llama-server \
-  --model gemma-4-12b-it-Q4_K_M.gguf \
-  --port 8080 \
-  --ctx-size 16384 \
-  --flash-attn on \
-  --jinja \
-  --reasoning off
+# 12B
+llama-server -hf unsloth/gemma-4-12b-it-GGUF:UD-Q4_K_XL \
+  --jinja -ngl 999 -fa -c 8192
+
+# 26B-A4B
+llama-server -hf unsloth/gemma-4-26B-A4B-it-GGUF:UD-Q4_K_M \
+  --jinja -ngl 999 -fa -c 8192
 ```
 
 ### shunt config
@@ -61,43 +61,37 @@ model    = "gemma-4-12b"
 
 ---
 
-## Qwen 3.6 (Alibaba)
+## Qwen (Alibaba)
 
-Stronger on multi-step reasoning tasks. The 27B model fits on two 16 GB cards or a single 24 GB card.
+Three practical options covering 6.5 GB to 22 GB VRAM. The 35B-A3B is a mixture-of-experts model with only 3B active parameters per forward pass.
 
-| Model | VRAM |
-|-------|------|
-| `Qwen3.6-7B` | ~6 GB |
-| `Qwen3.6-27B` | ~18 GB |
-
-Download: [unsloth/Qwen3.6-27B-GGUF](https://huggingface.co/unsloth/Qwen3.6-27B-GGUF)
+| Model | Quant | VRAM |
+|-------|-------|------|
+| `Qwen3.5-9B` | UD-Q4_K_XL | ~6.5 GB |
+| `Qwen3.6-27B` | Q4_K_S | ~16 GB |
+| `Qwen3.6-35B-A3B` | UD-Q4_K_M | ~22 GB |
 
 ### Server command
 
 ```sh
-# Single GPU
-llama-server \
-  --model Qwen3.6-27B-Q4_K_M.gguf \
-  --port 8080 \
-  --ctx-size 16384 \
-  --flash-attn on \
-  --jinja
+# Qwen3.5-9B
+llama-server -hf unsloth/Qwen3.5-9B-GGUF:UD-Q4_K_XL \
+  --jinja -ngl 999 -fa -c 8192
 
-# Two GPUs (tensor parallel)
-llama-server \
-  --model Qwen3.6-27B-Q4_K_M.gguf \
-  --port 8080 \
-  --ctx-size 32768 \
-  --flash-attn on \
-  --jinja \
-  -sm layer
+# Qwen3.6-27B
+llama-server -hf unsloth/Qwen3.6-27B-GGUF:Q4_K_S \
+  --jinja -ngl 999 -fa -c 8192
+
+# Qwen3.6-35B-A3B (MoE)
+llama-server -hf unsloth/Qwen3.6-35B-A3B-GGUF:UD-Q4_K_M \
+  --jinja -ngl 999 -fa -c 8192
 ```
 
 ### shunt config
 
 ```toml
 endpoint = "http://localhost:8080"
-model    = "qwen3.6-27b"
+model    = "qwen3.6-27b"   # or qwen3.5-9b
 ```
 
 ### Sampling profile
@@ -117,10 +111,11 @@ model    = "qwen3.6-27b"
 
 | Flag | Purpose |
 |------|---------|
-| `--jinja` | Jinja2 chat template — required for correct tool-call formatting |
-| `--reasoning off` | Disable server-side reasoning tokens (Gemma-4) |
-| `--flash-attn on` | Flash attention — significant speedup on CUDA |
-| `--ctx-size 16384` | Context window — 16K covers most tasks |
+| `-hf <repo:quant>` | Download and run directly from Hugging Face |
+| `--jinja` | Jinja2 chat template — required for tool-call formatting |
+| `-ngl 999` | Offload all layers to GPU |
+| `-fa` | Flash attention — significant speedup on CUDA |
+| `-c 8192` | Context window size |
 | `-sm layer` | Tensor parallel across multiple GPUs |
 
 ---
