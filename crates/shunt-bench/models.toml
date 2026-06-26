@@ -1,0 +1,34 @@
+# Model catalog for the capability benchmark.
+#   cargo run -p shunt-bench --bin capability -- crates/shunt-bench/models.toml 3
+#
+# Add a model = add a [[model]]. Start each model's server first (the bench just
+# points at the endpoint). Engines: "llamacpp" | "vllm" | "ollama".
+#
+# Suggested local llama.cpp launches (16GB cards):
+#   gemma:   CUDA_VISIBLE_DEVICES=1 llama-server -hf unsloth/gemma-4-12B-it-qat-GGUF:UD-Q4_K_XL \
+#              -ngl 99 -fa -c 32768 -ctk q8_0 -ctv q8_0 --port 8080
+#   qwen9b:  CUDA_VISIBLE_DEVICES=0 llama-server -hf unsloth/Qwen3.5-9B-GGUF:Q6_K \
+#              -ngl 99 -fa -c 32768 -ctk q8_0 -ctv q8_0 --port 8081
+#   qwen27b: llama-server -hf unsloth/Qwen3.6-27B-GGUF:Q6_K -ngl 99 -fa -sm layer \
+#              -c 32768 -ctk q8_0 -ctv q8_0 --port 8082   # -sm layer spans both cards
+
+[[model]]
+name = "gemma-4-12b-qat"
+engine = "llamacpp"
+endpoint = "http://127.0.0.1:8080"
+model_id = "gemma4-12b"
+timeout_secs = 90
+
+[[model]]
+name = "qwen3.5-9b"
+engine = "llamacpp"
+endpoint = "http://127.0.0.1:8081"
+model_id = "qwen3.5-9b"
+timeout_secs = 90
+
+[[model]]
+name = "qwen3.6-27b"
+engine = "llamacpp"
+endpoint = "http://127.0.0.1:8082"
+model_id = "qwen3.6-27b"
+timeout_secs = 90

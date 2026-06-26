@@ -1,0 +1,4 @@
+Request: {original_request}
+Goal: {interpreted_goal}
+
+Return the relative path of the new file to create.

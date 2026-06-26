@@ -1,0 +1,29 @@
+[package]
+name = "shunt-bench"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "shunt-bench"
+path = "src/main.rs"
+
+# Model-capability benchmark: `cargo run -p shunt-bench --bin capability -- models.toml`
+[[bin]]
+name = "capability"
+path = "src/bin/capability.rs"
+
+[dependencies]
+shunt-core    = { path = "../shunt-core" }
+shunt-edit    = { path = "../shunt-edit" }
+shunt-infer   = { path = "../shunt-infer" }
+shunt-localize = { path = "../shunt-localize" }
+shunt-runtime = { path = "../shunt-runtime" }
+
+serde         = { version = "1.0", features = ["derive"] }
+serde_json    = "1.0"
+tempfile      = "3"
+time          = { version = "0.3", features = ["macros"] }
+tokio         = { version = "1", features = ["rt-multi-thread"] }
+toml          = "0.8"
+tracing-subscriber = { workspace = true }

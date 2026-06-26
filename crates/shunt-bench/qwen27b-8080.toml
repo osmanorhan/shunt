@@ -1,0 +1,6 @@
+[[model]]
+name = "qwen3.6-27b"
+engine = "llamacpp"
+endpoint = "http://127.0.0.1:8080"
+model_id = "unsloth/Qwen3.6-27B-GGUF:Q4_K_S"
+timeout_secs = 180

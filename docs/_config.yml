@@ -1,0 +1,20 @@
+title: shunt
+description: A coding agent built for local language models.
+remote_theme: just-the-docs/just-the-docs
+
+url: https://osmanorhan.github.io
+baseurl: /shunt
+
+aux_links:
+  GitHub: https://github.com/osmanorhan/shunt
+
+color_scheme: dark
+
+# Navigation order
+nav_order_default: alpha
+
+footer_content: "MIT License &mdash; <a href=\"https://github.com/osmanorhan/shunt\">osmanorhan/shunt</a>"
+
+plugins:
+  - jekyll-remote-theme
+  - jekyll-seo-tag

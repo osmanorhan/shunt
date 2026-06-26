@@ -1,0 +1,10 @@
+Clarify this coding task. Check workspace_profile for conflicts before interpreting the request.
+
+original_request: {original_request}
+workspace_profile: {workspace_profile}
+observed_evidence: {observed_evidence}
+draft_interpreted_goal: {draft_interpreted_goal}
+existing_constraints: {existing_constraints}
+existing_success_criteria: {existing_success_criteria}
+
+Preserve concrete user intent; don't invent detail. Blockers only — 0-2 ambiguities.

@@ -1,0 +1,7 @@
+/target/
+.claude/
+*.sw[op]
+.DS_Store
+docs/_site
+docs/.jekyll-cache
+capability-logs/

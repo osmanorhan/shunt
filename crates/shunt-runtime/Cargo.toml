@@ -1,0 +1,20 @@
+[package]
+name = "shunt-runtime"
+edition.workspace = true
+license.workspace = true
+version.workspace = true
+
+[dependencies]
+shunt-core    = { path = "../shunt-core" }
+shunt-infer   = { path = "../shunt-infer" }
+shunt-knowledge = { path = "../shunt-knowledge" }
+shunt-localize = { path = "../shunt-localize" }
+shunt-store   = { path = "../shunt-store" }
+serde_json    = "1.0"
+thiserror     = "2.0"
+time          = { version = "0.3", features = ["std"] }
+tokio.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+time = { version = "0.3", features = ["macros"] }

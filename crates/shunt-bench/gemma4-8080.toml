@@ -1,0 +1,6 @@
+[[model]]
+name = "gemma-4-12b-qat"
+engine = "llamacpp"
+endpoint = "http://127.0.0.1:8080"
+model_id = "gemma4-12b"
+timeout_secs = 120

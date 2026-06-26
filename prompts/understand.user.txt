@@ -1,0 +1,15 @@
+Build an evidence-backed understanding of this task. Use only the request, draft, and evidence below; make no claim the evidence doesn't justify.
+
+original_request: {original_request}
+draft_interpreted_goal: {draft_interpreted_goal}
+draft_success_criteria: {draft_success_criteria}
+constraints: {constraints}
+target_scope: {target_scope}
+evidence: {evidence}
+package_facts: {package_facts}
+manual_evidence: {manual_evidence}
+
+- Prefer concrete, repo-backed language.
+- Treat exact/compatible manual evidence as authoritative package context; ignore unversioned manual evidence when it conflicts with repo evidence.
+- Keep target_scope and success_criteria minimal and outcome-focused.
+- Ambiguities only for blockers the evidence does not resolve.
