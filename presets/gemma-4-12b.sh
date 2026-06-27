@@ -32,4 +32,4 @@ exec ~/llama.cpp/build/bin/llama-server \
   --threads -1 \
   --flash-attn on \
   --jinja \
-  --reasoning off
+  --host 0.0.0.0
