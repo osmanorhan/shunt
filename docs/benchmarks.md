@@ -122,3 +122,55 @@ endpoint     = "http://127.0.0.1:8080"
 model_id     = "gemma4-12b"
 timeout_secs = 120
 ```
+
+---
+
+## Terminal-Bench 2.1
+
+Terminal-Bench 2.1 should be run through Harbor, the official harness, so results stay comparable with the leaderboard. The repo provides a Harbor custom-agent import path that installs and runs `shunt` inside each task container while Harbor keeps the official task setup and grading path.
+
+Prerequisites:
+
+```sh
+uv tool install harbor
+harbor --help
+docker info
+```
+
+Smoke-test Harbor with the official oracle:
+
+```sh
+harbor run -d terminal-bench/terminal-bench-2-1 -a oracle -l 5
+```
+
+Run `shunt` through the official Terminal-Bench 2.1 dataset:
+
+```sh
+export PYTHONPATH="$PWD${PYTHONPATH:+:$PYTHONPATH}"
+export SHUNT_ENDPOINT="http://host.docker.internal:8080"
+export SHUNT_MODEL="qwen3.6-27b"
+
+harbor run \
+  -d terminal-bench/terminal-bench-2-1 \
+  --agent-import-path "benchmarks.terminal_bench.shunt_agent:ShuntAgent" \
+  -m "local/qwen3.6-27b" \
+  -k 5
+```
+
+Useful overrides:
+
+- `SHUNT_ENDPOINT` sets the OpenAI-compatible endpoint visible from the task container.
+- `SHUNT_MODEL` sets the model id written to `.shunt/config.toml`.
+- `SHUNT_INSTALL_COMMAND` replaces the default release installer, useful for testing a branch or private build.
+- `SHUNT_TIMEOUT_SECS` sets the per-LLM-call timeout in `.shunt/config.toml`.
+- `SHUNT_RUN_TIMEOUT_SECS` sets Harbor's command timeout for one task attempt.
+
+For one task:
+
+```sh
+harbor run \
+  -d terminal-bench/terminal-bench-2-1 \
+  --agent-import-path "benchmarks.terminal_bench.shunt_agent:ShuntAgent" \
+  -m "local/qwen3.6-27b" \
+  --include-task-name "<task-name>"
+```
