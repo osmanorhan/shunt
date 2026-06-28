@@ -195,6 +195,14 @@ cargo build --release -p shunt-cli
 
 Requires Rust 1.85+.
 
+Enable the repo's pre-commit checks with:
+
+```sh
+./scripts/install-git-hooks.sh
+```
+
+That hook runs `cargo fmt --all` and `cargo clippy --workspace --all-targets --locked -- -D warnings` before each commit.
+
 ---
 
 ## License

@@ -894,7 +894,7 @@ impl<'a, P: ToolProvider> AgentSession<'a, P> {
                     Some(a) => a,
                     None => {
                         if let Some(ref err) = last_err
-                            && is_invalid_action_error(&err)
+                            && is_invalid_action_error(err)
                         {
                             let detail = format!(
                                 "Error: previous model response was invalid or incomplete ({err}). Return exactly one valid JSON tool action that matches the schema."
