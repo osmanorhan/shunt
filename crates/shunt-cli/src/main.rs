@@ -3164,6 +3164,7 @@ mod tests {
             success_criteria: vec![],
             constraints: vec![],
             target_scope: vec!["crates/shunt-localize/src/lib.rs".into()],
+            work_contract: Default::default(),
             evidence: vec![],
             candidate_files: vec![shunt_core::CandidateFile {
                 path: "crates/shunt-localize/src/lib.rs".into(),

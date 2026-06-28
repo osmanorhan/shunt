@@ -355,6 +355,7 @@ mod tests {
             success_criteria: vec!["tests pass".into()],
             constraints: vec!["stay local-first".into()],
             target_scope: vec!["src/config.rs".into()],
+            work_contract: Default::default(),
             evidence: vec![EvidenceRef {
                 kind: EvidenceKind::File,
                 locator: "src/config.rs".into(),

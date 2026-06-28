@@ -294,5 +294,105 @@ pub fn suite() -> Vec<CapabilityTask> {
                 },
             )],
         },
+        // T11: service-style task with a new route plus a smoke script. This is closer
+        // to Terminal-Bench tasks because the verifier can legitimately start the
+        // server, curl it, and inspect behavior instead of only reading files.
+        CapabilityTask {
+            name: "node_health_route_smoke",
+            difficulty: Difficulty::Hard,
+            request: "In this small Node service, add a GET /healthz endpoint that returns JSON with `{ ok: true, version: process.env.APP_VERSION ?? 'dev' }`, keep the existing /users/:id route working, and add a new smoke script at scripts/smoke-health.sh that curls the health endpoint.",
+            files: &[
+                (
+                    "package.json",
+                    "{\n  \"name\": \"mini-service\",\n  \"version\": \"1.0.0\",\n  \"type\": \"module\",\n  \"scripts\": {\n    \"start\": \"node src/server.js\"\n  }\n}\n",
+                ),
+                (
+                    "src/server.js",
+                    "import http from 'node:http';\n\nfunction json(res, status, body) {\n  res.writeHead(status, { 'content-type': 'application/json' });\n  res.end(JSON.stringify(body));\n}\n\nconst server = http.createServer((req, res) => {\n  if (!req.url) {\n    return json(res, 400, { error: 'missing_url' });\n  }\n\n  if (req.url.startsWith('/users/')) {\n    const id = req.url.slice('/users/'.length);\n    return json(res, 200, { id, role: 'member' });\n  }\n\n  return json(res, 404, { error: 'not_found' });\n});\n\nserver.listen(process.env.PORT ?? 3000);\n",
+                ),
+            ],
+            checks: &[
+                ("src/server.js", |c| {
+                    c.contains("/healthz")
+                        && c.contains("APP_VERSION")
+                        && c.contains("ok")
+                        && c.contains("/users/")
+                }),
+                ("scripts/smoke-health.sh", |c| {
+                    c.contains("curl") && c.contains("healthz")
+                }),
+            ],
+        },
+        // T12: manifest + implementation + tests. The model should update package.json,
+        // refactor the code, and keep the test expectation in sync.
+        CapabilityTask {
+            name: "dependency_refactor_slugify",
+            difficulty: Difficulty::Hard,
+            request: "Add the npm dependency `slugify`, replace the manual slug building in src/title.js with `slugify(title, { lower: true, trim: true, strict: true })`, and update the test in tests/title.test.js to assert that punctuation is removed.",
+            files: &[
+                (
+                    "package.json",
+                    "{\n  \"name\": \"title-tools\",\n  \"version\": \"1.0.0\",\n  \"type\": \"module\",\n  \"scripts\": {\n    \"test\": \"node --test\"\n  },\n  \"dependencies\": {}\n}\n",
+                ),
+                (
+                    "package-lock.json",
+                    "{\n  \"name\": \"title-tools\",\n  \"lockfileVersion\": 3,\n  \"packages\": {}\n}\n",
+                ),
+                (
+                    "src/title.js",
+                    "export function toTitleId(title) {\n  return title\n    .trim()\n    .toLowerCase()\n    .replace(/[^a-z0-9\\s-]/g, '')\n    .replace(/\\s+/g, '-')\n    .replace(/-+/g, '-');\n}\n",
+                ),
+                (
+                    "tests/title.test.js",
+                    "import test from 'node:test';\nimport assert from 'node:assert/strict';\nimport { toTitleId } from '../src/title.js';\n\ntest('builds a title id', () => {\n  assert.equal(toTitleId(' Hello, World! 2026 '), 'hello,-world!-2026');\n});\n",
+                ),
+            ],
+            checks: &[
+                ("package.json", |c| c.contains("slugify")),
+                ("src/title.js", |c| {
+                    c.contains("slugify(") && c.contains("strict: true")
+                }),
+                ("tests/title.test.js", |c| {
+                    c.contains("hello-world-2026") && !c.contains("hello,-world!-2026")
+                }),
+            ],
+        },
+        // T13: thread a new flag through config, CLI parsing, and rendering. This
+        // forces the model to touch multiple files and keep behavior/docs aligned.
+        CapabilityTask {
+            name: "thread_json_flag_cli",
+            difficulty: Difficulty::Hard,
+            request: "Add a `--json` flag to this Rust CLI. Parse it in src/main.rs, thread it through ReportOptions in src/report.rs, make render_report output compact JSON when json is true, and update README.md usage to mention the new flag.",
+            files: &[
+                (
+                    "Cargo.toml",
+                    "[package]\nname = \"report-cli\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
+                ),
+                (
+                    "src/main.rs",
+                    "mod report;\n\nuse report::{render_report, ReportOptions};\n\nfn main() {\n    let args: Vec<String> = std::env::args().collect();\n    let verbose = args.iter().any(|arg| arg == \"--verbose\");\n    let options = ReportOptions { verbose };\n    println!(\"{}\", render_report(7, &options));\n}\n",
+                ),
+                (
+                    "src/report.rs",
+                    "pub struct ReportOptions {\n    pub verbose: bool,\n}\n\npub fn render_report(total: usize, options: &ReportOptions) -> String {\n    if options.verbose {\n        format!(\"processed {total} records\")\n    } else {\n        total.to_string()\n    }\n}\n",
+                ),
+                (
+                    "README.md",
+                    "# report-cli\n\nUsage:\n\n`cargo run -- --verbose`\n",
+                ),
+            ],
+            checks: &[
+                ("src/main.rs", |c| {
+                    c.contains("--json")
+                        && (c.contains("json:") || c.contains("ReportOptions { verbose, json }"))
+                }),
+                ("src/report.rs", |c| {
+                    c.contains("pub json: bool")
+                        && c.contains("total")
+                        && c.contains("options.json")
+                }),
+                ("README.md", |c| c.contains("--json")),
+            ],
+        },
     ]
 }

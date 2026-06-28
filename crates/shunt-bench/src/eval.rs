@@ -118,6 +118,7 @@ fn make_artifact(request: &str) -> UnderstandingArtifact {
         success_criteria: vec![],
         constraints: vec![],
         target_scope: vec![],
+        work_contract: Default::default(),
         evidence: vec![],
         candidate_files: vec![],
         package_facts: vec![],

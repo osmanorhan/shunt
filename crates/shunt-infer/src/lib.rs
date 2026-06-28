@@ -12,7 +12,8 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use shunt_core::{
     Ambiguity, AmbiguityKind, AmbiguityStatus, EvidenceRef, ManualEvidence, ManualVersionStatus,
-    PackageFact, Risk, RiskSeverity, UnderstandingArtifact, VerifierOutcome, VerifierStatus,
+    PackageFact, RequiredPath, RequiredPathIntent, Risk, RiskSeverity, UnderstandingArtifact,
+    VerifierOutcome, VerifierStatus, WorkContract,
 };
 use std::path::Path;
 use std::sync::{
@@ -458,11 +459,7 @@ impl OpenAiCompatProvider {
                     },
                 ],
                 temperature: Some(self.capabilities.temperature),
-                // 2048 cap: grammar-constrained tool selection JSON is tiny (~50 tokens)
-                // but think.query can be verbose (~1100 tokens observed).  2048 gives
-                // headroom without the 90s runaway risk of 8192 — integer-field runaway
-                // at 2048 tokens tops out at ~22s (2048 × 11ms), well within call_timeout.
-                max_tokens: 2048,
+                max_tokens: action_schema_max_tokens(&tool.parameters),
                 top_p: self.capabilities.top_p,
                 top_k: self.capabilities.top_k,
                 min_p: self.capabilities.min_p,
@@ -558,8 +555,7 @@ impl OpenAiCompatProvider {
                 model: self.model.clone(),
                 messages: processed,
                 temperature: Some(self.capabilities.temperature),
-                // 2048 cap: same reason as request_for — see comment there.
-                max_tokens: 2048,
+                max_tokens: action_schema_max_tokens(&tool.parameters),
                 top_p: self.capabilities.top_p,
                 top_k: self.capabilities.top_k,
                 min_p: self.capabilities.min_p,
@@ -1282,9 +1278,35 @@ pub struct UnderstandOutput {
     pub interpreted_goal: String,
     pub success_criteria: Vec<String>,
     pub target_scope: Vec<String>,
+    #[serde(default)]
+    pub work_contract: UnderstandWorkContract,
     pub ambiguities: Vec<ClarifyAmbiguity>,
     pub risks: Vec<UnderstandRisk>,
     pub confidence: f32,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default, JsonSchema)]
+pub struct UnderstandWorkContract {
+    #[serde(default)]
+    pub required_paths: Vec<UnderstandRequiredPath>,
+    #[serde(default)]
+    pub behavioral_checks: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct UnderstandRequiredPath {
+    pub path: String,
+    pub intent: UnderstandRequiredPathIntent,
+    pub reason: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum UnderstandRequiredPathIntent {
+    #[default]
+    Exist,
+    CreateOrUpdate,
+    Remove,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
@@ -1339,6 +1361,25 @@ impl UnderstandOutput {
         if !self.target_scope.is_empty() {
             artifact.target_scope = self.target_scope;
         }
+        artifact.work_contract = WorkContract {
+            required_paths: self
+                .work_contract
+                .required_paths
+                .into_iter()
+                .map(|path| RequiredPath {
+                    path: path.path,
+                    intent: match path.intent {
+                        UnderstandRequiredPathIntent::Exist => RequiredPathIntent::Exist,
+                        UnderstandRequiredPathIntent::CreateOrUpdate => {
+                            RequiredPathIntent::CreateOrUpdate
+                        }
+                        UnderstandRequiredPathIntent::Remove => RequiredPathIntent::Remove,
+                    },
+                    reason: path.reason,
+                })
+                .collect(),
+            behavioral_checks: self.work_contract.behavioral_checks,
+        };
         artifact.ambiguities = map_ambiguities(self.ambiguities);
         artifact.risks = self
             .risks
@@ -1643,6 +1684,22 @@ fn strip_think_blocks(input: &str) -> &str {
     trimmed
 }
 
+fn action_schema_max_tokens(parameters: &serde_json::Value) -> u32 {
+    let tools = parameters
+        .get("properties")
+        .and_then(|properties| properties.get("tool"))
+        .and_then(|tool| tool.get("enum"))
+        .and_then(serde_json::Value::as_array);
+    let compact = tools.is_some_and(|tools| {
+        !tools.iter().any(|tool| {
+            tool.as_str()
+                .is_some_and(|name| matches!(name, "think" | "search_files"))
+        })
+    });
+
+    if compact { 512 } else { 2048 }
+}
+
 // ── Internal HTTP types: OpenAI-compat ───────────────────────────────────────
 
 #[derive(Debug, Serialize)]
@@ -1875,6 +1932,7 @@ mod tests {
             success_criteria: vec![],
             constraints: vec![],
             target_scope: vec![],
+            work_contract: Default::default(),
             evidence: vec![],
             candidate_files: vec![],
             package_facts: vec![],
@@ -1909,6 +1967,7 @@ mod tests {
             success_criteria: vec![],
             constraints: vec![],
             target_scope: vec![],
+            work_contract: Default::default(),
             evidence: vec![],
             candidate_files: vec![],
             package_facts: vec![],
@@ -1947,6 +2006,7 @@ mod tests {
             success_criteria: vec![],
             constraints: vec![],
             target_scope: vec![],
+            work_contract: Default::default(),
             evidence: vec![EvidenceRef {
                 kind: EvidenceKind::Other,
                 locator: "workspace-profile".into(),
@@ -1993,6 +2053,7 @@ mod tests {
             success_criteria: vec![],
             constraints: vec!["keep the implementation lean".into()],
             target_scope: vec!["crates/shunt-core".into()],
+            work_contract: Default::default(),
             evidence: vec![EvidenceRef {
                 kind: EvidenceKind::File,
                 locator: "crates/shunt-core/src/lib.rs".into(),
@@ -2173,6 +2234,25 @@ mod tests {
         assert_eq!(req["response_format"]["type"], "json_schema");
         assert_eq!(req["response_format"]["json_schema"]["name"], "output");
         assert!(req["response_format"]["json_schema"]["schema"].is_object());
+    }
+
+    #[test]
+    fn compact_action_schema_uses_smaller_token_budget() {
+        let compact = serde_json::json!({
+            "type": "object",
+            "properties": {
+                "tool": {"type": "string", "enum": ["replace_lines", "read_file", "command", "done"]}
+            }
+        });
+        let exploratory = serde_json::json!({
+            "type": "object",
+            "properties": {
+                "tool": {"type": "string", "enum": ["think", "read_file", "search_files", "command", "done"]}
+            }
+        });
+
+        assert_eq!(super::action_schema_max_tokens(&compact), 512);
+        assert_eq!(super::action_schema_max_tokens(&exploratory), 2048);
     }
 
     #[test]

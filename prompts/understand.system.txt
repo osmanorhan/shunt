@@ -7,4 +7,9 @@ Keep output lean — context is small:
 - 0-2 ambiguities, only blockers the evidence cannot resolve.
 - Keep risks concrete and tied to missing evidence or scope uncertainty.
 
-Fields: interpreted_goal (string), success_criteria (string[]), target_scope (string[]), ambiguities ([{question, options[]}]), risks ([{summary, severity: Low|Medium|High}]), confidence (number 0-1).
+Fields: interpreted_goal (string), success_criteria (string[]), target_scope (string[]), work_contract ({required_paths, behavioral_checks}), ambiguities ([{question, options[]}]), risks ([{summary, severity: Low|Medium|High}]), confidence (number 0-1).
+
+The work_contract is the observable contract for completion:
+- required_paths: only include paths explicitly required by the request or evidence. Each item has path, intent, reason.
+- required_paths.intent is one of: exist, create_or_update, remove.
+- behavioral_checks: concise observable outcomes that require running or semantic verification.

@@ -267,6 +267,8 @@ pub struct UnderstandingArtifact {
     pub success_criteria: Vec<String>,
     pub constraints: Vec<String>,
     pub target_scope: Vec<String>,
+    #[serde(default)]
+    pub work_contract: WorkContract,
     pub evidence: Vec<EvidenceRef>,
     #[serde(default)]
     pub candidate_files: Vec<CandidateFile>,
@@ -289,6 +291,38 @@ pub struct UnderstandingArtifact {
     pub created_at: OffsetDateTime,
     #[serde(with = "time::serde::rfc3339")]
     pub updated_at: OffsetDateTime,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct WorkContract {
+    /// Observable workspace paths that must satisfy the requested final state.
+    /// These are produced during understanding, not guessed by execution.
+    #[serde(default)]
+    pub required_paths: Vec<RequiredPath>,
+    /// Outcome checks that require semantic execution or external verification.
+    /// Runtime stores these for prompts/verifiers; deterministic enforcement starts
+    /// with path facts because they are observable without language assumptions.
+    #[serde(default)]
+    pub behavioral_checks: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RequiredPath {
+    pub path: String,
+    pub intent: RequiredPathIntent,
+    pub reason: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum RequiredPathIntent {
+    /// The path must exist after the work is complete.
+    #[default]
+    Exist,
+    /// The path must be created or changed by the work.
+    CreateOrUpdate,
+    /// The path must not exist after the work is complete.
+    Remove,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

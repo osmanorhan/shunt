@@ -64,6 +64,7 @@ pub struct ProviderRegistry {
 pub struct KnowledgeService {
     resolvers: ResolverRegistry,
     providers: ProviderRegistry,
+    ambiguity_resolvers: Vec<Box<dyn AmbiguityResolver>>,
     manual_limit: usize,
 }
 
@@ -110,6 +111,7 @@ impl Default for KnowledgeService {
         Self {
             resolvers: ResolverRegistry::default(),
             providers: ProviderRegistry::default(),
+            ambiguity_resolvers: default_ambiguity_resolvers(),
             manual_limit: DEFAULT_MANUAL_LIMIT,
         }
     }
@@ -364,24 +366,25 @@ impl KnowledgeService {
         })
     }
 
-    /// For each `Lookup`-kind open ambiguity, try every registered resolver.
-    /// Returns a vec of `(ambiguity_id, resolution_text)` for those successfully resolved.
-    pub fn resolve_lookup_ambiguities(
-        &self,
-        ambiguities: &[&Ambiguity],
-        resolvers: &[Box<dyn AmbiguityResolver>],
-    ) -> Vec<(String, String)> {
+    pub fn resolve_lookup_ambiguities(&self, ambiguities: &[&Ambiguity]) -> Vec<(String, String)> {
         let mut results = Vec::new();
         for ambiguity in ambiguities {
-            for resolver in resolvers {
+            for resolver in &self.ambiguity_resolvers {
                 if let Some(resolution) = resolver.resolve(ambiguity) {
                     results.push((ambiguity.id.clone(), resolution));
-                    break; // first resolver that succeeds wins
+                    break;
                 }
             }
         }
         results
     }
+}
+
+fn default_ambiguity_resolvers() -> Vec<Box<dyn AmbiguityResolver>> {
+    vec![
+        Box::new(NpmRegistryResolver::default()),
+        Box::new(CratesIoResolver::default()),
+    ]
 }
 
 impl ProviderRegistry {
@@ -1079,6 +1082,7 @@ mod tests {
             success_criteria: vec![],
             constraints: vec![],
             target_scope: vec!["src/main.rs".into()],
+            work_contract: Default::default(),
             evidence: vec![],
             candidate_files: vec![],
             package_facts: vec![],

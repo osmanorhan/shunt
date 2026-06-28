@@ -1967,6 +1967,7 @@ dependencies = [
  "shunt-knowledge",
  "shunt-localize",
  "shunt-store",
+ "tempfile",
  "thiserror 2.0.18",
  "time",
  "tokio",

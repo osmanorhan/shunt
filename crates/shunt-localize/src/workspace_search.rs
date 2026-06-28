@@ -22,9 +22,8 @@ const EXCLUDED_DIRS: &[&str] = &[
 ];
 
 fn is_excluded(path: &Path) -> bool {
-    path.components().any(|c| {
-        matches!(c.as_os_str().to_str(), Some(name) if EXCLUDED_DIRS.contains(&name))
-    })
+    path.components()
+        .any(|c| matches!(c.as_os_str().to_str(), Some(name) if EXCLUDED_DIRS.contains(&name)))
 }
 /// Cap returned files so a broad query can't flood the agent's context.
 const MAX_HITS: usize = 50;

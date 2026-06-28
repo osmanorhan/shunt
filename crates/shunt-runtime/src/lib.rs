@@ -9,6 +9,7 @@ use std::fs;
 use std::path::Path;
 use std::process::Command;
 use std::sync::Arc;
+use std::time::Duration;
 
 use crate::probes::ScopeOrchestrator;
 use shunt_core::ledger::{AgentBudget, AgentFrame, GoalSnapshot, WorkLedger};
@@ -16,19 +17,33 @@ use shunt_core::{
     AmbiguityKind, AmbiguityStatus, ApprovalState, ApprovalStatus, ArtifactId, CandidateFile,
     ChangeSet, CorrectionKind, CorrectionPackage, EvidenceKind, EvidenceRef, ExecutionStageKind,
     FileOp, FrontierCase, FrontierCaseId, FrontierReason, FrontierStatus, RecipeRef, RecipeRun,
-    RecipeRunId, RuntimeEvent, RuntimeEventKind, StageRecord, StageStatus, TaskId, TaskPhase,
-    TaskRun, UncertaintyEvent, UncertaintyKind, UnderstandingArtifact, VerifierOutcome,
-    VerifierStatus,
+    RecipeRunId, RequiredPathIntent, RuntimeEvent, RuntimeEventKind, StageRecord, StageStatus,
+    TaskId, TaskPhase, TaskRun, UncertaintyEvent, UncertaintyKind, UnderstandingArtifact,
+    VerifierOutcome, VerifierStatus,
 };
 use shunt_infer::{
     AgentObserver, AgentResult, AgentSession, ClarifyNode, SourceFileContext, ToolProvider,
     UnderstandNode,
 };
-use shunt_knowledge::{AmbiguityResolver, CratesIoResolver, KnowledgeService, NpmRegistryResolver};
+use shunt_knowledge::KnowledgeService;
 use shunt_localize::{ContextPacket, Localizer, RetrievalBackend, SearchQuery, SemanticLocalizer};
 use shunt_store::{SqliteStore, StoreError};
 use thiserror::Error;
 use time::OffsetDateTime;
+
+const MAX_REPAIR_DIAGNOSTICS: usize = 4;
+const MAX_REPAIR_OUTPUT_CHARS: usize = 2000;
+const PROPOSE_SESSION_WALL_TIMEOUT: Duration = Duration::from_secs(300);
+const VERIFIER_SESSION_WALL_TIMEOUT: Duration = Duration::from_secs(90);
+const REPAIR_SESSION_WALL_TIMEOUT: Duration = Duration::from_secs(120);
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RepairDiagnostic {
+    source: &'static str,
+    command: Option<String>,
+    summary: String,
+    output: String,
+}
 
 #[derive(Debug, Error)]
 pub enum RuntimeError {
@@ -594,6 +609,7 @@ impl TaskRuntime {
             success_criteria: vec![],
             constraints: vec![],
             target_scope: vec![],
+            work_contract: Default::default(),
             evidence: vec![],
             candidate_files: vec![],
             package_facts: vec![],
@@ -691,7 +707,7 @@ impl TaskRuntime {
         output.apply_to(&mut artifact);
 
         // Auto-resolve Lookup-kind ambiguities before surfacing anything to the user.
-        let resolved = auto_resolve_lookup_ambiguities(&mut artifact);
+        let resolved = auto_resolve_lookup_ambiguities(&self.knowledge, &mut artifact);
         if resolved > 0 {
             tracing::debug!(
                 "clarify_task: resolved {resolved} lookup ambiguity/ambiguities, re-running clarify"
@@ -1153,6 +1169,7 @@ impl TaskRuntime {
         // without needing to issue read_file calls for the most likely files.
         let mut session = AgentSession::new(provider, &task.workspace_root)
             .with_budget(session_budget.clone())
+            .with_wall_timeout(PROPOSE_SESSION_WALL_TIMEOUT)
             .with_pre_loaded(&all_candidates)
             .with_ignore_patterns(extra_ignore_patterns.iter().cloned());
         if let Some(obs) = self.agent_observer.clone() {
@@ -1198,7 +1215,8 @@ impl TaskRuntime {
             // pre-existing issues (e.g. deprecated tsconfig options).
             let baseline_errors = workspace_check(&task.workspace_root);
 
-            let first_result = session.run(&artifact.original_request);
+            let execute_request = execution_request(&artifact);
+            let first_result = session.run(&execute_request);
 
             match first_result {
                 AgentResult::Done {
@@ -1208,71 +1226,19 @@ impl TaskRuntime {
                     ..
                 } => {
                     let cs = build_change_set(ops, setup_commands);
+                    let diagnostics = collect_repair_diagnostics(
+                        provider,
+                        &task.workspace_root,
+                        &artifact,
+                        &cs,
+                        &done_file_state,
+                        baseline_errors.as_ref(),
+                        &extra_ignore_patterns,
+                        self.budget_override.as_ref(),
+                        self.agent_observer.clone(),
+                    )?;
 
-                    // Run a verifier session using the same provider — QA pass with surgical
-                    // smoke tests. Falls back to a static workspace_check on verifier failure
-                    // to avoid false positives from transient infra issues (port in use, etc.).
-                    tracing::info!("running verifier session");
-                    let failure: Option<String> = {
-                        let pre_loaded: Vec<SourceFileContext> = done_file_state
-                            .iter()
-                            .map(|(p, c)| SourceFileContext {
-                                path: p.clone(),
-                                contents: c.clone(),
-                            })
-                            .collect();
-                        let changed = done_file_state
-                            .keys()
-                            .cloned()
-                            .collect::<Vec<_>>()
-                            .join(", ");
-                        let verify_task = format!(
-                            "Verify that the following changes correctly implement the task.\n\n\
-                             Original task: {}\n\nChanged files: {changed}\n\n\
-                             Run the build, then run surgical smoke tests for what changed. \
-                             Call done with 'PASS: ...' or 'FAIL: ...'",
-                            artifact.original_request,
-                        );
-                        let verifier_budget = {
-                            let mut b = shunt_infer::SessionBudget::for_verifier();
-                            if let Some(o) = &self.budget_override {
-                                b.apply_override(o);
-                            }
-                            b
-                        };
-                        let mut vsession =
-                            AgentSession::new_verifier(provider, &task.workspace_root)
-                                .with_budget(verifier_budget)
-                                .with_pre_loaded(&pre_loaded)
-                                .with_ignore_patterns(extra_ignore_patterns.iter().cloned());
-                        if let Some(obs) = self.agent_observer.clone() {
-                            vsession = vsession.with_observer(obs);
-                        }
-                        match vsession.run(&verify_task) {
-                            AgentResult::Done { description, .. } => {
-                                if description.trim_start().to_uppercase().starts_with("PASS") {
-                                    tracing::info!("verifier: PASS");
-                                    None
-                                } else {
-                                    tracing::info!(
-                                        "verifier: FAIL — {}",
-                                        &description[..description.len().min(200)]
-                                    );
-                                    Some(description)
-                                }
-                            }
-                            // Verifier timed out or got confused — fall back to static check.
-                            _ => {
-                                let post_error = workspace_check(&task.workspace_root);
-                                match (&baseline_errors, &post_error) {
-                                    (None, Some(e)) => Some(e.clone()),
-                                    _ => None,
-                                }
-                            }
-                        }
-                    };
-
-                    if let Some(error) = failure {
+                    if !diagnostics.is_empty() {
                         tracing::info!("fix loop triggered");
                         let fix_pre_loaded: Vec<shunt_infer::SourceFileContext> = done_file_state
                             .into_iter()
@@ -1281,13 +1247,10 @@ impl TaskRuntime {
                                 contents,
                             })
                             .collect();
-                        let fix_request = format!(
-                            "{}\n\nVerification failed. Fix the errors:\n\n{}",
-                            artifact.original_request,
-                            &error[..error.len().min(2000)],
-                        );
+                        let fix_request = build_repair_request(&execute_request, &diagnostics);
                         let mut fix_session = AgentSession::new(provider, &task.workspace_root)
                             .with_budget(session_budget.clone())
+                            .with_wall_timeout(REPAIR_SESSION_WALL_TIMEOUT)
                             .with_pre_loaded(&fix_pre_loaded)
                             .with_ignore_patterns(extra_ignore_patterns.iter().cloned());
                         if let Some(obs) = self.agent_observer.clone() {
@@ -1333,6 +1296,10 @@ impl TaskRuntime {
             change_set.ops.len(),
             change_set.commands.len()
         );
+
+        if let Some(error) = validate_work_contract(&task.workspace_root, &artifact, &change_set) {
+            return Err(RuntimeError::Other(error));
+        }
 
         if let Some(stage) = recipe_run
             .stages
@@ -1818,36 +1785,641 @@ fn load_agent_context(store: &SqliteStore, task_id: &str) -> String {
     AgentFrame::from_ledger(&ledger, 10, AgentBudget::default()).format_context()
 }
 
+fn execution_request(artifact: &UnderstandingArtifact) -> String {
+    let contract = contract_prompt_section(artifact);
+    if contract.is_empty() {
+        artifact.original_request.clone()
+    } else {
+        format!("{}\n\n{}", artifact.original_request, contract)
+    }
+}
+
+fn contract_prompt_section(artifact: &UnderstandingArtifact) -> String {
+    let contract = &artifact.work_contract;
+    if contract.required_paths.is_empty() && contract.behavioral_checks.is_empty() {
+        return String::new();
+    }
+
+    let mut section = String::from("UNDERSTOOD WORK CONTRACT:\n");
+    if !contract.required_paths.is_empty() {
+        section.push_str("Required path facts:\n");
+        for path in &contract.required_paths {
+            section.push_str(&format!(
+                "- {} [{:?}]: {}\n",
+                path.path, path.intent, path.reason
+            ));
+        }
+    }
+    if !contract.behavioral_checks.is_empty() {
+        section.push_str("Behavioral checks:\n");
+        for check in &contract.behavioral_checks {
+            section.push_str(&format!("- {check}\n"));
+        }
+    }
+    section.push_str("Do not call done until this contract is satisfied.");
+    section
+}
+
+fn validate_work_contract(
+    workspace_root: &str,
+    artifact: &UnderstandingArtifact,
+    change_set: &ChangeSet,
+) -> Option<String> {
+    let mut failures = Vec::new();
+    for required in &artifact.work_contract.required_paths {
+        let Some(path) = workspace_relative_path(workspace_root, &required.path) else {
+            failures.push(format!(
+                "required path '{}' is outside the workspace ({})",
+                required.path, required.reason
+            ));
+            continue;
+        };
+        let projected = projected_path_state(workspace_root, &path, change_set);
+        match required.intent {
+            RequiredPathIntent::Exist if !projected.exists => failures.push(format!(
+                "required path '{}' does not exist after proposed changes ({})",
+                required.path, required.reason
+            )),
+            RequiredPathIntent::CreateOrUpdate if !projected.exists || !projected.touched => {
+                failures.push(format!(
+                    "required path '{}' was not created or updated ({})",
+                    required.path, required.reason
+                ));
+            }
+            RequiredPathIntent::Remove if projected.exists => failures.push(format!(
+                "required path '{}' still exists after proposed changes ({})",
+                required.path, required.reason
+            )),
+            _ => {}
+        }
+    }
+
+    if failures.is_empty() {
+        None
+    } else {
+        Some(format!(
+            "work contract unsatisfied:\n{}",
+            failures
+                .into_iter()
+                .map(|failure| format!("- {failure}"))
+                .collect::<Vec<_>>()
+                .join("\n")
+        ))
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ProjectedPathState {
+    exists: bool,
+    touched: bool,
+}
+
+fn projected_path_state(
+    workspace_root: &str,
+    relative_path: &str,
+    change_set: &ChangeSet,
+) -> ProjectedPathState {
+    let root = Path::new(workspace_root);
+    let mut state = ProjectedPathState {
+        exists: root.join(relative_path).exists(),
+        touched: false,
+    };
+
+    for op in &change_set.ops {
+        match op {
+            FileOp::Create { path, .. } | FileOp::Edit { path, .. } => {
+                if workspace_relative_path(workspace_root, path).as_deref() == Some(relative_path) {
+                    state.exists = true;
+                    state.touched = true;
+                }
+            }
+            FileOp::Delete { path } => {
+                if workspace_relative_path(workspace_root, path).as_deref() == Some(relative_path) {
+                    state.exists = false;
+                    state.touched = true;
+                }
+            }
+        }
+    }
+
+    state
+}
+
+fn workspace_relative_path(workspace_root: &str, path: &str) -> Option<String> {
+    let trimmed = path.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let supplied = Path::new(trimmed);
+    let relative = if supplied.is_absolute() {
+        let root = Path::new(workspace_root);
+        supplied.strip_prefix(root).ok()?.to_path_buf()
+    } else {
+        supplied.to_path_buf()
+    };
+    if relative.components().any(|component| {
+        matches!(
+            component,
+            std::path::Component::ParentDir | std::path::Component::RootDir
+        )
+    }) {
+        return None;
+    }
+    Some(relative.to_string_lossy().into_owned())
+}
+
 /// Run a fast workspace sanity check after the agent writes files.
-/// Returns `Some(error_output)` if the check fails, `None` if it passes or no checker is found.
-fn workspace_check(workspace_root: &str) -> Option<String> {
+/// Returns a structured diagnostic if the check fails, `None` if it passes or no checker is found.
+fn workspace_check(workspace_root: &str) -> Option<RepairDiagnostic> {
     use std::process::Command;
     let root = std::path::Path::new(workspace_root);
     if root.join("Cargo.toml").exists() {
+        let command = "cargo check --message-format=short --quiet";
         let out = Command::new("cargo")
             .args(["check", "--message-format=short", "--quiet"])
             .current_dir(root)
             .output()
             .ok()?;
         if !out.status.success() {
-            let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
-            return Some(stderr);
+            return Some(RepairDiagnostic {
+                source: "workspace_check",
+                command: Some(command.into()),
+                summary: "projected workspace check failed".into(),
+                output: truncate_chars(
+                    &String::from_utf8_lossy(&out.stderr),
+                    MAX_REPAIR_OUTPUT_CHARS,
+                ),
+            });
         }
     } else if root.join("package.json").exists() {
         // Use `tsc --noEmit` if tsconfig present, else skip (npm test is too slow for inline loop).
         if root.join("tsconfig.json").exists() {
+            let command = "npx tsc --noEmit --pretty false";
             let out = Command::new("npx")
                 .args(["tsc", "--noEmit", "--pretty", "false"])
                 .current_dir(root)
                 .output()
                 .ok()?;
             if !out.status.success() {
-                let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
-                return Some(stdout);
+                return Some(RepairDiagnostic {
+                    source: "workspace_check",
+                    command: Some(command.into()),
+                    summary: "projected workspace check failed".into(),
+                    output: truncate_chars(
+                        &String::from_utf8_lossy(&out.stdout),
+                        MAX_REPAIR_OUTPUT_CHARS,
+                    ),
+                });
             }
         }
     }
     None
+}
+
+fn collect_repair_diagnostics<P: ToolProvider>(
+    provider: &P,
+    workspace_root: &str,
+    artifact: &UnderstandingArtifact,
+    change_set: &ChangeSet,
+    done_file_state: &std::collections::HashMap<String, String>,
+    baseline_error: Option<&RepairDiagnostic>,
+    extra_ignore_patterns: &[String],
+    budget_override: Option<&shunt_infer::SessionBudgetOverride>,
+    observer: Option<Arc<dyn AgentObserver + Send + Sync>>,
+) -> RuntimeResult<Vec<RepairDiagnostic>> {
+    let projected = tempfile::tempdir()?;
+    let projected_root = projected.path().join("workspace");
+    copy_workspace_tree(Path::new(workspace_root), &projected_root)?;
+    apply_change_set_transactional(&projected_root, change_set)?;
+
+    let projected_root_str = projected_root.to_string_lossy().into_owned();
+    let mut diagnostics = Vec::new();
+
+    diagnostics.extend(structural_file_diagnostics(change_set, done_file_state));
+    diagnostics.extend(explicit_literal_coverage_diagnostics(
+        &artifact.original_request,
+        change_set,
+        done_file_state,
+    ));
+
+    let safe_setup_commands: Vec<shunt_core::CommandSpec> = change_set
+        .commands
+        .iter()
+        .filter(|spec| {
+            matches!(
+                shunt_core::safety::classify(spec),
+                shunt_core::safety::CommandSafety::Safe
+            )
+        })
+        .cloned()
+        .collect();
+    let setup_outcomes =
+        crate::executor::run_commands(&projected_root_str, &safe_setup_commands, |_| {}, |_| {});
+    for outcome in setup_outcomes.iter().filter(|outcome| !outcome.success) {
+        diagnostics.push(RepairDiagnostic {
+            source: "setup",
+            command: Some(outcome.spec.display()),
+            summary: "projected setup command failed".into(),
+            output: truncate_chars(&format_command_outcome(outcome), MAX_REPAIR_OUTPUT_CHARS),
+        });
+    }
+
+    if diagnostics.is_empty() {
+        let pre_loaded: Vec<SourceFileContext> = done_file_state
+            .iter()
+            .map(|(path, contents)| SourceFileContext {
+                path: path.clone(),
+                contents: contents.clone(),
+            })
+            .collect();
+        let changed = done_file_state
+            .keys()
+            .cloned()
+            .collect::<Vec<_>>()
+            .join(", ");
+        let verify_task = format!(
+            "Verify that the following changes correctly implement the task.\n\n\
+             Original task: {}\n\n{}\n\nChanged files: {changed}\n\n\
+             Run the build, then run surgical smoke tests for what changed. \
+             Call done with 'PASS: ...' or 'FAIL: ...'",
+            artifact.original_request,
+            contract_prompt_section(artifact),
+        );
+        let verifier_budget = {
+            let mut b = shunt_infer::SessionBudget::for_verifier();
+            if let Some(o) = budget_override {
+                b.apply_override(o);
+            }
+            b
+        };
+        let mut vsession = AgentSession::new_verifier(provider, &projected_root_str)
+            .with_budget(verifier_budget)
+            .with_wall_timeout(VERIFIER_SESSION_WALL_TIMEOUT)
+            .with_pre_loaded(&pre_loaded)
+            .with_ignore_patterns(extra_ignore_patterns.iter().cloned());
+        if let Some(obs) = observer {
+            vsession = vsession.with_observer(obs);
+        }
+        match vsession.run(&verify_task) {
+            AgentResult::Done { description, .. } => {
+                if description.trim_start().to_uppercase().starts_with("PASS") {
+                    tracing::info!("verifier: PASS");
+                } else {
+                    tracing::info!(
+                        "verifier: FAIL — {}",
+                        &description[..description.len().min(200)]
+                    );
+                    diagnostics.push(RepairDiagnostic {
+                        source: "verifier",
+                        command: None,
+                        summary: "verifier reported failure".into(),
+                        output: truncate_chars(description.trim(), MAX_REPAIR_OUTPUT_CHARS),
+                    });
+                }
+            }
+            AgentResult::NeedsClarification {
+                question, context, ..
+            } => diagnostics.push(RepairDiagnostic {
+                source: "verifier",
+                command: None,
+                summary: "verifier asked for clarification".into(),
+                output: truncate_chars(
+                    &format!("question: {question}\ncontext: {context}"),
+                    MAX_REPAIR_OUTPUT_CHARS,
+                ),
+            }),
+            AgentResult::MaxTurnsReached => {
+                tracing::info!("verifier did not complete; falling back to deterministic checks")
+            }
+        }
+
+        if let Some(post_error) = workspace_check(&projected_root_str)
+            && is_novel_diagnostic(baseline_error, &post_error)
+        {
+            diagnostics.push(post_error);
+        }
+    }
+
+    diagnostics.truncate(MAX_REPAIR_DIAGNOSTICS);
+    Ok(diagnostics)
+}
+
+fn explicit_literal_coverage_diagnostics(
+    request: &str,
+    change_set: &ChangeSet,
+    file_state: &std::collections::HashMap<String, String>,
+) -> Vec<RepairDiagnostic> {
+    let touched_paths = change_set
+        .ops
+        .iter()
+        .map(|op| op.path().to_string())
+        .collect::<Vec<_>>();
+    if touched_paths.is_empty() {
+        return Vec::new();
+    }
+    let touched_set = touched_paths
+        .iter()
+        .cloned()
+        .collect::<std::collections::HashSet<_>>();
+    let content_literals = explicit_request_literals(request)
+        .into_iter()
+        .filter(|literal| !touched_set.contains(literal))
+        .collect::<Vec<_>>();
+    if content_literals.is_empty() {
+        return Vec::new();
+    }
+
+    let request_lower = request.to_ascii_lowercase();
+    let mut diagnostics = Vec::new();
+    for path in touched_paths {
+        let path_lower = path.to_ascii_lowercase();
+        let basename_lower = std::path::Path::new(&path)
+            .file_name()
+            .and_then(|name| name.to_str())
+            .map(|name| name.to_ascii_lowercase())
+            .unwrap_or_default();
+        if !request_lower.contains(&path_lower) && !request_lower.contains(&basename_lower) {
+            continue;
+        }
+        let Some(content) = file_state.get(&path) else {
+            continue;
+        };
+        if content_literals
+            .iter()
+            .any(|literal| content.contains(literal))
+        {
+            continue;
+        }
+        diagnostics.push(RepairDiagnostic {
+            source: "request_literal_coverage",
+            command: None,
+            summary: format!(
+                "changed file '{path}' does not contain any explicit request literals"
+            ),
+            output: format!(
+                "Request literals: {}\nFile: {path}",
+                content_literals.join(", ")
+            ),
+        });
+    }
+    diagnostics
+}
+
+fn structural_file_diagnostics(
+    change_set: &ChangeSet,
+    file_state: &std::collections::HashMap<String, String>,
+) -> Vec<RepairDiagnostic> {
+    let mut diagnostics = Vec::new();
+    let mut seen_paths = std::collections::HashSet::new();
+    for path in change_set.ops.iter().map(|op| op.path().to_string()) {
+        if !seen_paths.insert(path.clone()) {
+            continue;
+        }
+        if !is_structural_check_candidate(&path) {
+            continue;
+        }
+        let Some(content) = file_state.get(&path) else {
+            continue;
+        };
+        let warnings = structural_warnings(content);
+        if warnings.is_empty() {
+            continue;
+        }
+        diagnostics.push(RepairDiagnostic {
+            source: "structure",
+            command: None,
+            summary: format!("changed file '{path}' has structural anomalies"),
+            output: warnings.join("\n"),
+        });
+    }
+    diagnostics
+}
+
+fn is_structural_check_candidate(path: &str) -> bool {
+    matches!(
+        Path::new(path).extension().and_then(|ext| ext.to_str()),
+        Some(
+            "rs" | "ts"
+                | "tsx"
+                | "js"
+                | "jsx"
+                | "mjs"
+                | "cjs"
+                | "json"
+                | "go"
+                | "java"
+                | "c"
+                | "cc"
+                | "cpp"
+                | "h"
+                | "hpp"
+                | "cs"
+        )
+    )
+}
+
+fn structural_warnings(contents: &str) -> Vec<String> {
+    let mut warnings = Vec::new();
+    let mut brace_depth = 0i32;
+    for ch in contents.chars() {
+        match ch {
+            '{' => brace_depth += 1,
+            '}' => brace_depth -= 1,
+            _ => {}
+        }
+    }
+    if brace_depth > 0 {
+        warnings.push(format!(
+            "brace balance appears to have {brace_depth} unmatched '{{'"
+        ));
+    } else if brace_depth < 0 {
+        warnings.push(format!(
+            "brace balance appears to have {} unmatched '}}'",
+            brace_depth.abs()
+        ));
+    }
+
+    let mut declarations = std::collections::HashMap::new();
+    for (idx, line) in contents.lines().enumerate() {
+        let Some(key) = declaration_key(line) else {
+            continue;
+        };
+        if let Some(first_line) = declarations.get(&key) {
+            warnings.push(format!(
+                "duplicate declaration '{key}' at lines {first_line} and {}",
+                idx + 1
+            ));
+        } else {
+            declarations.insert(key, idx + 1);
+        }
+    }
+
+    warnings
+}
+
+fn declaration_key(line: &str) -> Option<String> {
+    let mut trimmed = line.trim();
+    for prefix in ["export default ", "export ", "pub "] {
+        if let Some(rest) = trimmed.strip_prefix(prefix) {
+            trimmed = rest.trim_start();
+        }
+    }
+    if let Some(rest) = trimmed.strip_prefix("async ") {
+        trimmed = rest.trim_start();
+    }
+
+    for prefix in [
+        "function ",
+        "fn ",
+        "class ",
+        "interface ",
+        "type ",
+        "struct ",
+        "enum ",
+        "trait ",
+    ] {
+        if let Some(rest) = trimmed.strip_prefix(prefix) {
+            let name = rest
+                .split(|ch: char| !(ch.is_ascii_alphanumeric() || ch == '_'))
+                .next()
+                .unwrap_or("")
+                .trim();
+            if !name.is_empty() {
+                return Some(format!("{} {}", prefix.trim_end(), name));
+            }
+        }
+    }
+
+    None
+}
+
+fn explicit_request_literals(request: &str) -> Vec<String> {
+    let mut literals = Vec::new();
+    let mut in_tick = false;
+    let mut current = String::new();
+    for ch in request.chars() {
+        if ch == '`' {
+            if in_tick {
+                let lit = current.trim();
+                if !lit.is_empty() {
+                    literals.push(lit.to_string());
+                }
+                current.clear();
+            }
+            in_tick = !in_tick;
+            continue;
+        }
+        if in_tick {
+            current.push(ch);
+        }
+    }
+    literals.sort();
+    literals.dedup();
+    literals
+}
+
+fn build_repair_request(execute_request: &str, diagnostics: &[RepairDiagnostic]) -> String {
+    let mut request = String::new();
+    request.push_str(execute_request);
+    request.push_str("\n\nRepair the failing implementation using these exact diagnostics. Fix the concrete failing cause first.\n\nREPAIR DIAGNOSTICS:\n");
+    for (idx, diagnostic) in diagnostics.iter().enumerate() {
+        request.push_str(&format!(
+            "{}. source: {}\n   summary: {}\n",
+            idx + 1,
+            diagnostic.source,
+            diagnostic.summary
+        ));
+        if let Some(command) = &diagnostic.command {
+            request.push_str(&format!("   command: {command}\n"));
+        }
+        request.push_str("   output:\n");
+        for line in diagnostic.output.lines() {
+            request.push_str("   ");
+            request.push_str(line);
+            request.push('\n');
+        }
+    }
+    request.push_str("Use the diagnostics above instead of re-deriving the failure from scratch.");
+    request
+}
+
+fn is_novel_diagnostic(baseline: Option<&RepairDiagnostic>, candidate: &RepairDiagnostic) -> bool {
+    baseline
+        .map(|base| base.command != candidate.command || base.output != candidate.output)
+        .unwrap_or(true)
+}
+
+fn format_command_outcome(outcome: &shunt_core::CommandOutcome) -> String {
+    let stdout = outcome.stdout.trim();
+    let stderr = outcome.stderr.trim();
+    match (stdout.is_empty(), stderr.is_empty()) {
+        (true, true) => format!("exit_code: {}", outcome.exit_code),
+        (false, true) => format!("exit_code: {}\nstdout:\n{}", outcome.exit_code, stdout),
+        (true, false) => format!("exit_code: {}\nstderr:\n{}", outcome.exit_code, stderr),
+        (false, false) => format!(
+            "exit_code: {}\nstdout:\n{}\nstderr:\n{}",
+            outcome.exit_code, stdout, stderr
+        ),
+    }
+}
+
+fn truncate_chars(text: &str, max_chars: usize) -> String {
+    let mut out = String::new();
+    let mut count = 0usize;
+    for ch in text.chars() {
+        if count == max_chars {
+            out.push_str("...[truncated]");
+            break;
+        }
+        out.push(ch);
+        count += 1;
+    }
+    out
+}
+
+fn copy_workspace_tree(src: &Path, dst: &Path) -> Result<(), std::io::Error> {
+    fs::create_dir_all(dst)?;
+    for entry in fs::read_dir(src)? {
+        let entry = entry?;
+        let src_path = entry.path();
+        let dst_path = dst.join(entry.file_name());
+        let file_type = entry.file_type()?;
+        if file_type.is_dir() {
+            copy_workspace_tree(&src_path, &dst_path)?;
+        } else if file_type.is_file() {
+            if let Some(parent) = dst_path.parent() {
+                fs::create_dir_all(parent)?;
+            }
+            fs::copy(&src_path, &dst_path)?;
+        } else if file_type.is_symlink() {
+            copy_symlink(&src_path, &dst_path)?;
+        }
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn copy_symlink(src: &Path, dst: &Path) -> Result<(), std::io::Error> {
+    use std::os::unix::fs as unix_fs;
+    if let Some(parent) = dst.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let target = fs::read_link(src)?;
+    unix_fs::symlink(target, dst)
+}
+
+#[cfg(not(unix))]
+fn copy_symlink(src: &Path, dst: &Path) -> Result<(), std::io::Error> {
+    let resolved = fs::canonicalize(src)?;
+    if resolved.is_dir() {
+        copy_workspace_tree(&resolved, dst)
+    } else {
+        if let Some(parent) = dst.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        fs::copy(resolved, dst)?;
+        Ok(())
+    }
 }
 
 const MAX_EVIDENCE_PER_SCOPE: usize = 6;
@@ -2558,12 +3130,10 @@ fn has_open_user_decision_ambiguity(artifact: &UnderstandingArtifact) -> bool {
 /// Mutates the artifact in-place, marking resolved ones as Resolved and
 /// injecting the resolution as a manual evidence hint.
 /// Returns the count of ambiguities that were successfully resolved.
-fn auto_resolve_lookup_ambiguities(artifact: &mut UnderstandingArtifact) -> usize {
-    let resolvers: Vec<Box<dyn AmbiguityResolver>> = vec![
-        Box::new(NpmRegistryResolver::default()),
-        Box::new(CratesIoResolver::default()),
-    ];
-
+fn auto_resolve_lookup_ambiguities(
+    knowledge: &KnowledgeService,
+    artifact: &mut UnderstandingArtifact,
+) -> usize {
     let lookup_ids: Vec<String> = artifact
         .ambiguities
         .iter()
@@ -2581,7 +3151,7 @@ fn auto_resolve_lookup_ambiguities(artifact: &mut UnderstandingArtifact) -> usiz
         .filter(|a| lookup_ids.contains(&a.id))
         .collect();
 
-    let resolutions = artifact_resolve_ambiguities(&lookup_refs, &resolvers);
+    let resolutions = knowledge.resolve_lookup_ambiguities(&lookup_refs);
     let resolved_count = resolutions.len();
 
     for (id, resolution) in resolutions {
@@ -2607,22 +3177,6 @@ fn auto_resolve_lookup_ambiguities(artifact: &mut UnderstandingArtifact) -> usiz
     }
 
     resolved_count
-}
-
-fn artifact_resolve_ambiguities(
-    ambiguities: &[&shunt_core::Ambiguity],
-    resolvers: &[Box<dyn AmbiguityResolver>],
-) -> Vec<(String, String)> {
-    let mut results = Vec::new();
-    for ambiguity in ambiguities {
-        for resolver in resolvers {
-            if let Some(resolution) = resolver.resolve(ambiguity) {
-                results.push((ambiguity.id.clone(), resolution));
-                break;
-            }
-        }
-    }
-    results
 }
 
 fn observe_workspace_evidence(
@@ -3148,8 +3702,9 @@ mod tests {
 
     use shunt_core::{
         ApprovalStatus, CandidateFile, ChangeSet, CorrectionKind, EvidenceKind, EvidenceRef,
-        ExecutionStageKind, FileOp, FrontierReason, FrontierStatus, RecipeRef, StageStatus,
-        TaskPhase, UncertaintyEvent, UncertaintyKind, VerifierStatus,
+        ExecutionStageKind, FileOp, FrontierReason, FrontierStatus, RecipeRef, RequiredPath,
+        RequiredPathIntent, StageStatus, TaskPhase, UncertaintyEvent, UncertaintyKind,
+        VerifierStatus, WorkContract,
     };
     use shunt_infer::{ToolCall, ToolProvider, ToolSpec};
     use time::OffsetDateTime;
@@ -3157,6 +3712,258 @@ mod tests {
 
     use super::{ArtifactUpdate, TaskRuntime};
     use shunt_store::SqliteStore;
+
+    #[test]
+    fn work_contract_accepts_created_required_path() {
+        let root = temp_workspace("work-contract-created");
+        fs::create_dir_all(&root).unwrap();
+        let store = SqliteStore::open_in_memory().unwrap();
+        let runtime = TaskRuntime::new(store);
+        let now = datetime!(2026-05-01 12:00 UTC);
+        let (_, mut artifact) = runtime
+            .start_task(
+                now,
+                "task-contract-created",
+                "artifact-contract-created",
+                root.display().to_string(),
+                "create the output file",
+            )
+            .unwrap();
+        artifact.work_contract = WorkContract {
+            required_paths: vec![RequiredPath {
+                path: "out.txt".into(),
+                intent: RequiredPathIntent::CreateOrUpdate,
+                reason: "requested output".into(),
+            }],
+            behavioral_checks: vec![],
+        };
+        let change_set = ChangeSet {
+            ops: vec![FileOp::Create {
+                path: "out.txt".into(),
+                contents: "ok".into(),
+            }],
+            commands: vec![],
+        };
+
+        assert!(
+            super::validate_work_contract(&root.display().to_string(), &artifact, &change_set)
+                .is_none()
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn work_contract_rejects_missing_required_path() {
+        let root = temp_workspace("work-contract-missing");
+        fs::create_dir_all(&root).unwrap();
+        let store = SqliteStore::open_in_memory().unwrap();
+        let runtime = TaskRuntime::new(store);
+        let now = datetime!(2026-05-01 12:00 UTC);
+        let (_, mut artifact) = runtime
+            .start_task(
+                now,
+                "task-contract-missing",
+                "artifact-contract-missing",
+                root.display().to_string(),
+                "create the output file",
+            )
+            .unwrap();
+        artifact.work_contract = WorkContract {
+            required_paths: vec![RequiredPath {
+                path: "out.txt".into(),
+                intent: RequiredPathIntent::CreateOrUpdate,
+                reason: "requested output".into(),
+            }],
+            behavioral_checks: vec![],
+        };
+        let change_set = ChangeSet {
+            ops: vec![],
+            commands: vec![],
+        };
+
+        let error =
+            super::validate_work_contract(&root.display().to_string(), &artifact, &change_set)
+                .expect("contract should fail");
+        assert!(error.contains("out.txt"));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn work_contract_normalizes_absolute_workspace_paths() {
+        let root = temp_workspace("work-contract-absolute");
+        fs::create_dir_all(&root).unwrap();
+        let absolute = root.join("out.txt").display().to_string();
+        let relative = super::workspace_relative_path(&root.display().to_string(), &absolute);
+
+        assert_eq!(relative.as_deref(), Some("out.txt"));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn repair_request_formats_named_diagnostics() {
+        let request = super::build_repair_request(
+            "fix the failing task",
+            &[
+                super::RepairDiagnostic {
+                    source: "setup",
+                    command: Some("pnpm install".into()),
+                    summary: "projected setup command failed".into(),
+                    output: "stderr:\nnetwork down".into(),
+                },
+                super::RepairDiagnostic {
+                    source: "workspace_check",
+                    command: Some("cargo check --message-format=short --quiet".into()),
+                    summary: "projected workspace check failed".into(),
+                    output: "src/lib.rs:1:1: expected item".into(),
+                },
+            ],
+        );
+
+        assert!(request.contains("REPAIR DIAGNOSTICS:"));
+        assert!(request.contains("source: setup"));
+        assert!(request.contains("command: pnpm install"));
+        assert!(request.contains("expected item"));
+    }
+
+    #[test]
+    fn explicit_literal_coverage_flags_named_file_missing_literal() {
+        let diagnostics = super::explicit_literal_coverage_diagnostics(
+            "Add a `--json` flag and update README.md to mention `--json`.",
+            &ChangeSet {
+                ops: vec![FileOp::Create {
+                    path: "README.md".into(),
+                    contents: "# title\nUsage\n".into(),
+                }],
+                commands: vec![],
+            },
+            &std::collections::HashMap::from([("README.md".into(), "# title\nUsage\n".into())]),
+        );
+
+        assert_eq!(diagnostics.len(), 1);
+        assert_eq!(diagnostics[0].source, "request_literal_coverage");
+        assert!(diagnostics[0].summary.contains("README.md"));
+        assert!(diagnostics[0].output.contains("--json"));
+    }
+
+    #[test]
+    fn structural_file_diagnostics_flags_corrupted_changed_file() {
+        let content =
+            "export function loadUser() {\n  try {\n}\n\nexport function loadUser() {\n}\n";
+        let diagnostics = super::structural_file_diagnostics(
+            &ChangeSet {
+                ops: vec![FileOp::Create {
+                    path: "src/users.ts".into(),
+                    contents: content.into(),
+                }],
+                commands: vec![],
+            },
+            &std::collections::HashMap::from([("src/users.ts".into(), content.into())]),
+        );
+
+        assert_eq!(diagnostics.len(), 1);
+        assert_eq!(diagnostics[0].source, "structure");
+        assert!(diagnostics[0].output.contains("unmatched"));
+        assert!(diagnostics[0].output.contains("function loadUser"));
+    }
+
+    #[test]
+    fn explicit_request_literals_extracts_backticked_content() {
+        let literals = super::explicit_request_literals(
+            "Add `--json` in `src/main.rs` and thread it through `ReportOptions`.",
+        );
+        assert!(literals.contains(&"--json".to_string()));
+        assert!(literals.contains(&"src/main.rs".to_string()));
+        assert!(literals.contains(&"ReportOptions".to_string()));
+    }
+
+    #[test]
+    fn projected_workspace_check_uses_applied_change_set() {
+        let root = unique_temp_dir("projected-workspace-check");
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::write(
+            root.join("Cargo.toml"),
+            "[package]\nname = \"projected-workspace-check\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
+        )
+        .unwrap();
+        fs::write(root.join("src/lib.rs"), "pub fn ready() -> bool { true }\n").unwrap();
+
+        assert!(super::workspace_check(&root.display().to_string()).is_none());
+
+        let projected = tempfile::tempdir().unwrap();
+        let projected_root = projected.path().join("workspace");
+        super::copy_workspace_tree(&root, &projected_root).unwrap();
+        super::apply_change_set_transactional(
+            &projected_root,
+            &ChangeSet {
+                ops: vec![FileOp::Edit {
+                    path: "src/lib.rs".into(),
+                    search: "pub fn ready() -> bool { true }\n".into(),
+                    replacement: "pub fn ready( -> bool { true }\n".into(),
+                }],
+                commands: vec![],
+            },
+        )
+        .unwrap();
+
+        let projected_failure = super::workspace_check(&projected_root.display().to_string());
+        assert!(projected_failure.is_some());
+        assert!(projected_failure.unwrap().output.contains("src/lib.rs"));
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn collect_repair_diagnostics_returns_setup_failure_without_verifier() {
+        let root = unique_temp_dir("repair-setup-failure");
+        fs::create_dir_all(&root).unwrap();
+        let store = SqliteStore::open_in_memory().unwrap();
+        let runtime = TaskRuntime::new(store);
+        let now = datetime!(2026-05-01 12:00 UTC);
+        let (_, artifact) = runtime
+            .start_task(
+                now,
+                "task-setup-failure",
+                "artifact-setup-failure",
+                root.display().to_string(),
+                "repair setup failure",
+            )
+            .unwrap();
+
+        let diagnostics = super::collect_repair_diagnostics(
+            &StubProvider,
+            &root.display().to_string(),
+            &artifact,
+            &ChangeSet {
+                ops: vec![],
+                commands: vec![shunt_core::CommandSpec::new(
+                    "definitely-not-a-real-command",
+                    std::iter::empty::<&str>(),
+                )],
+            },
+            &std::collections::HashMap::new(),
+            None,
+            &[],
+            None,
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(diagnostics.len(), 1);
+        assert_eq!(diagnostics[0].source, "setup");
+        assert!(diagnostics[0].output.contains("spawn error"));
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    fn temp_workspace(name: &str) -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "shunt-runtime-{name}-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ))
+    }
 
     #[test]
     fn starts_and_revises_a_task() {

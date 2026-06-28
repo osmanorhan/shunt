@@ -12,4 +12,7 @@ manual_evidence: {manual_evidence}
 - Prefer concrete, repo-backed language.
 - Treat exact/compatible manual evidence as authoritative package context; ignore unversioned manual evidence when it conflicts with repo evidence.
 - Keep target_scope and success_criteria minimal and outcome-focused.
+- Populate work_contract from explicit requirements only. Do not infer hidden files or checks.
+- Use required_paths for concrete path obligations, including files that must be created, updated, exist, or be removed.
+- Use behavioral_checks for observable outcomes that cannot be proven by path existence alone.
 - Ambiguities only for blockers the evidence does not resolve.
