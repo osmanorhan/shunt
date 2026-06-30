@@ -12,7 +12,7 @@ mod task;
 
 pub use model::{Catalog, Engine, ModelSpec};
 pub use score::{ModelScorecard, Outcome, RunMetrics, TaskScore, render_report};
-pub use task::{CapabilityTask, ContentCheck, Difficulty, suite};
+pub use task::{CapabilityTask, ContentCheck, Difficulty, bench_suite, suite};
 
 use std::net::{TcpStream, ToSocketAddrs};
 use std::path::Path;

@@ -1233,7 +1233,7 @@ impl TaskRuntime {
                         &cs,
                         &done_file_state,
                         baseline_errors.as_ref(),
-                        &extra_ignore_patterns,
+                        extra_ignore_patterns,
                         self.budget_override.as_ref(),
                         self.agent_observer.clone(),
                     )?;
@@ -1976,6 +1976,7 @@ fn workspace_check(workspace_root: &str) -> Option<RepairDiagnostic> {
     None
 }
 
+#[allow(clippy::too_many_arguments)]
 fn collect_repair_diagnostics<P: ToolProvider>(
     provider: &P,
     workspace_root: &str,
@@ -2365,14 +2366,12 @@ fn format_command_outcome(outcome: &shunt_core::CommandOutcome) -> String {
 
 fn truncate_chars(text: &str, max_chars: usize) -> String {
     let mut out = String::new();
-    let mut count = 0usize;
-    for ch in text.chars() {
+    for (count, ch) in text.chars().enumerate() {
         if count == max_chars {
             out.push_str("...[truncated]");
             break;
         }
         out.push(ch);
-        count += 1;
     }
     out
 }

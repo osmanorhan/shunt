@@ -16,6 +16,11 @@ path = "src/main.rs"
 name = "capability"
 path = "src/bin/capability.rs"
 
+# Pure agentic stack benchmark: `cargo run -p shunt-bench --bin pure -- pure-models.toml`
+[[bin]]
+name = "pure"
+path = "src/bin/pure.rs"
+
 [dependencies]
 shunt-core    = { path = "../shunt-core" }
 shunt-edit    = { path = "../shunt-edit" }
@@ -23,6 +28,7 @@ shunt-infer   = { path = "../shunt-infer" }
 shunt-localize = { path = "../shunt-localize" }
 shunt-runtime = { path = "../shunt-runtime" }
 
+reqwest       = { version = "0.12", features = ["blocking", "json"] }
 serde         = { version = "1.0", features = ["derive"] }
 serde_json    = "1.0"
 tempfile      = "3"
