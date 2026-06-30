@@ -42,6 +42,8 @@ pub struct ModelSpec {
     pub model_id: String,
     #[serde(default = "default_timeout")]
     pub timeout_secs: u64,
+    /// Optional quantization label for the leaderboard (e.g. "Q4_K_M", "4-bit").
+    pub quant: Option<String>,
 }
 
 fn default_timeout() -> u64 {

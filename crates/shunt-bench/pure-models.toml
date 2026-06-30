@@ -1,0 +1,25 @@
+# pure-bench catalog: one [[model]] per stack entry.
+# All entries hit /v1/chat/completions.
+
+[[model]]
+name = "Qwen3.6-9B-AWQ"
+engine = "vllm"
+quant = "Q4"
+endpoint = "http://127.0.0.1:8000"
+model_id = "Qwen/Qwen3.6-9B-AWQ"
+timeout_secs = 120
+
+[[model]]
+name = "Qwen3.5-4B"
+engine = "ollama"
+endpoint = "http://127.0.0.1:11434"
+model_id = "qwen3.5:4b"
+timeout_secs = 120
+
+[[model]]
+name = "Gemma4-12B"
+engine = "llama.cpp"
+quant = "Q4_K_M"
+endpoint = "http://127.0.0.1:8080"
+model_id = "gemma-4-12b"
+timeout_secs = 120
