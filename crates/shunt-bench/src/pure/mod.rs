@@ -12,7 +12,7 @@ pub mod tools;
 use std::net::{TcpStream, ToSocketAddrs};
 use std::time::Duration;
 
-use crate::capability::{bench_suite, Catalog, Difficulty, ModelSpec, suite, CapabilityTask};
+use crate::capability::{CapabilityTask, Catalog, Difficulty, ModelSpec, bench_suite, suite};
 
 pub use report::{EntryScore, PureTaskScore, render_pure_report};
 
@@ -50,7 +50,10 @@ pub fn run_catalog_filtered(
                 scope.spawn(move || run_model(spec, &tasks, runs))
             })
             .collect();
-        handles.into_iter().map(|h| h.join().expect("pure bench thread panicked")).collect()
+        handles
+            .into_iter()
+            .map(|h| h.join().expect("pure bench thread panicked"))
+            .collect()
     })
 }
 
@@ -95,43 +98,50 @@ fn run_model(spec: &ModelSpec, tasks: &[CapabilityTask], runs: usize) -> EntrySc
         task_scores: Vec::new(),
     };
 
-    let task_scores = tasks.iter().map(|task| {
-        eprint!("    {:<22} {:<7} ", task.name, task.difficulty.label());
-        let mut run_metrics = Vec::with_capacity(runs);
+    let task_scores = tasks
+        .iter()
+        .map(|task| {
+            eprint!("    {:<22} {:<7} ", task.name, task.difficulty.label());
+            let mut run_metrics = Vec::with_capacity(runs);
 
-        for run_idx in 0..runs {
-            let ws = task.workspace();
-            let trace = run_loop(&client, &loop_cfg, &task.full_request(), ws.root());
-            let passed = task.passed(&ws);
+            for run_idx in 0..runs {
+                let ws = task.workspace();
+                let trace = run_loop(&client, &loop_cfg, &task.full_request(), ws.root());
+                let passed = task.passed(&ws);
 
-            let metrics = reduce(&trace, passed);
-            eprint!("{}", metrics.outcome.glyph());
+                let metrics = reduce(&trace, passed);
+                eprint!("{}", metrics.outcome.glyph());
 
-            let file_snapshots: Vec<(&str, String, bool)> = task
-                .checks
-                .iter()
-                .map(|(rel, check)| {
-                    let content = std::fs::read_to_string(ws.root().join(rel)).unwrap_or_default();
-                    let ok = check(&content);
-                    (*rel, content, ok)
-                })
-                .collect();
+                let file_snapshots: Vec<(&str, String, bool)> = task
+                    .checks
+                    .iter()
+                    .map(|(rel, check)| {
+                        let content =
+                            std::fs::read_to_string(ws.root().join(rel)).unwrap_or_default();
+                        let ok = check(&content);
+                        (*rel, content, ok)
+                    })
+                    .collect();
 
-            write_run_log(&entry, task, run_idx + 1, &metrics, &trace, &file_snapshots);
-            run_metrics.push(metrics);
+                write_run_log(&entry, task, run_idx + 1, &metrics, &trace, &file_snapshots);
+                run_metrics.push(metrics);
 
-            // Let the workspace drop before next run.
-            drop(ws);
-        }
-        eprintln!();
-        PureTaskScore {
-            task: task.name.to_string(),
-            difficulty: task.difficulty.label().to_string(),
-            runs: run_metrics,
-        }
-    }).collect();
+                // Let the workspace drop before next run.
+                drop(ws);
+            }
+            eprintln!();
+            PureTaskScore {
+                task: task.name.to_string(),
+                difficulty: task.difficulty.label().to_string(),
+                runs: run_metrics,
+            }
+        })
+        .collect();
 
-    EntryScore { task_scores, ..entry }
+    EntryScore {
+        task_scores,
+        ..entry
+    }
 }
 
 fn entry_label(spec: &ModelSpec) -> String {
@@ -149,7 +159,11 @@ fn reachable(endpoint: &str) -> bool {
         .next()
         .unwrap_or("");
     // Add default port if missing so ToSocketAddrs can resolve it.
-    let hostport = if hostport.contains(':') { hostport.to_string() } else { format!("{hostport}:80") };
+    let hostport = if hostport.contains(':') {
+        hostport.to_string()
+    } else {
+        format!("{hostport}:80")
+    };
     match hostport.to_socket_addrs() {
         Ok(mut addrs) => addrs
             .next()

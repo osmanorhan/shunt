@@ -161,7 +161,9 @@ pub fn suite() -> Vec<CapabilityTask> {
             ],
             checks: &[
                 ("package.json", |c| {
-                    c.contains("vite") && c.contains("@vitejs/plugin-react") && !c.contains("react-scripts")
+                    c.contains("vite")
+                        && c.contains("@vitejs/plugin-react")
+                        && !c.contains("react-scripts")
                 }),
                 ("vite.config.ts", |c| {
                     c.contains("defineConfig") && c.contains("react()")
@@ -244,7 +246,8 @@ pub fn suite() -> Vec<CapabilityTask> {
                     !c.contains("async login(") && !c.contains("async verifyToken(")
                 }),
                 ("src/routes/auth.ts", |c| {
-                    (c.contains("services/auth") || c.contains("authService")) && !c.contains("userService.login")
+                    (c.contains("services/auth") || c.contains("authService"))
+                        && !c.contains("userService.login")
                 }),
             ],
         },
@@ -374,7 +377,8 @@ pub fn suite() -> Vec<CapabilityTask> {
                 ),
             ],
             checks: &[("src/routes/items.ts", |c| {
-                let encodes = c.contains("base64") || c.contains("btoa(")
+                let encodes = c.contains("base64")
+                    || c.contains("btoa(")
                     || (c.contains("Buffer.from(") && c.contains("toString("));
                 let returns_next = c.contains("nextCursor") || c.contains("next_cursor");
                 let no_offset = !(c.contains("page - 1") || c.contains("page-1"));
@@ -565,10 +569,17 @@ pub fn suite() -> Vec<CapabilityTask> {
                  return res;\n}\n",
             )],
             checks: &[("src/http/client.ts", |c| {
-                let has_retry = c.contains("attempt") || c.contains("retry") || c.contains("retries");
-                let has_backoff = (c.contains("2 **") || c.contains("2**") || c.contains("Math.pow(2,"))
-                    && (c.contains("setTimeout") || c.contains("sleep") || c.contains("delay") || c.contains("await new Promise"));
-                let guards_5xx = c.contains(">= 500") || c.contains("status >= 500") || c.contains("res.status >= 5");
+                let has_retry =
+                    c.contains("attempt") || c.contains("retry") || c.contains("retries");
+                let has_backoff =
+                    (c.contains("2 **") || c.contains("2**") || c.contains("Math.pow(2,"))
+                        && (c.contains("setTimeout")
+                            || c.contains("sleep")
+                            || c.contains("delay")
+                            || c.contains("await new Promise"));
+                let guards_5xx = c.contains(">= 500")
+                    || c.contains("status >= 500")
+                    || c.contains("res.status >= 5");
                 has_retry && has_backoff && guards_5xx
             })],
         },
@@ -639,7 +650,9 @@ pub fn suite() -> Vec<CapabilityTask> {
                 ("src/services/order.ts", |c| {
                     c.contains("correlationId") && c.contains("logger")
                 }),
-                ("src/middleware/errorHandler.ts", |c| c.contains("correlationId")),
+                ("src/middleware/errorHandler.ts", |c| {
+                    c.contains("correlationId")
+                }),
             ],
         },
         CapabilityTask {
@@ -674,10 +687,12 @@ pub fn suite() -> Vec<CapabilityTask> {
                 ),
             ],
             checks: &[("src/documents/repository.ts", |c| {
-                let accepts_version = c.contains("version:") || c.contains(", version)")
+                let accepts_version = c.contains("version:")
+                    || c.contains(", version)")
                     || c.contains(", version: number");
                 let uses_lock = c.contains("updateMany") && c.contains("version");
-                let throws_conflict = c.contains("409") || c.contains("Conflict") || c.contains("stale");
+                let throws_conflict =
+                    c.contains("409") || c.contains("Conflict") || c.contains("stale");
                 accepts_version && uses_lock && throws_conflict
             })],
         },
@@ -762,7 +777,9 @@ pub fn suite() -> Vec<CapabilityTask> {
             ],
             checks: &[("src/products/service.ts", |c| {
                 c.contains("redis.get")
-                    && (c.contains("redis.setEx") || c.contains("redis.set(") || c.contains("setex"))
+                    && (c.contains("redis.setEx")
+                        || c.contains("redis.set(")
+                        || c.contains("setex"))
                     && c.contains("JSON.stringify")
                     && c.contains("JSON.parse")
                     && c.contains("redis.del")
@@ -837,7 +854,9 @@ pub fn suite() -> Vec<CapabilityTask> {
             checks: &[("src/routes/auth.test.ts", |c| {
                 let count = c.matches("it(").count() + c.matches("test(").count();
                 (c.contains("supertest") || c.contains("request(app)"))
-                    && (c.contains("jest.mock") || c.contains("mockResolvedValue") || c.contains("jest.fn"))
+                    && (c.contains("jest.mock")
+                        || c.contains("mockResolvedValue")
+                        || c.contains("jest.fn"))
                     && c.contains("409")
                     && c.contains("401")
                     && c.contains("/me")
@@ -1065,10 +1084,10 @@ pub fn suite() -> Vec<CapabilityTask> {
                 ),
             ],
             checks: &[
-                ("src/types/user.ts",       |c| c.contains("tenantId")),
+                ("src/types/user.ts", |c| c.contains("tenantId")),
                 ("src/users/repository.ts", |c| c.contains("tenantId")),
-                ("src/users/service.ts",    |c| c.contains("tenantId")),
-                ("src/routes/users.ts",     |c| c.contains("tenantId")),
+                ("src/users/service.ts", |c| c.contains("tenantId")),
+                ("src/routes/users.ts", |c| c.contains("tenantId")),
             ],
         },
         CapabilityTask {
@@ -1305,11 +1324,19 @@ pub fn suite() -> Vec<CapabilityTask> {
             ],
             checks: &[
                 ("src/types/notification.ts", |c| {
-                    c.contains("type: 'email'") && c.contains("type: 'sms'") && c.contains("type: 'push'")
+                    c.contains("type: 'email'")
+                        && c.contains("type: 'sms'")
+                        && c.contains("type: 'push'")
                 }),
-                ("src/handlers/email.ts", |c| !c.contains(" as EmailNotification")),
-                ("src/handlers/sms.ts",   |c| !c.contains(" as SmsNotification")),
-                ("src/handlers/push.ts",  |c| !c.contains(" as PushNotification")),
+                ("src/handlers/email.ts", |c| {
+                    !c.contains(" as EmailNotification")
+                }),
+                ("src/handlers/sms.ts", |c| {
+                    !c.contains(" as SmsNotification")
+                }),
+                ("src/handlers/push.ts", |c| {
+                    !c.contains(" as PushNotification")
+                }),
             ],
         },
         CapabilityTask {
@@ -1398,8 +1425,10 @@ pub fn suite() -> Vec<CapabilityTask> {
                     && c.contains("redis.get")
                     && (c.contains("redis.set") || c.contains("redis.setEx"))
                     && c.contains("409")
-                    && (c.contains("in-flight") || c.contains("inflight")
-                        || c.contains("PROCESSING") || c.contains("processing")
+                    && (c.contains("in-flight")
+                        || c.contains("inflight")
+                        || c.contains("PROCESSING")
+                        || c.contains("processing")
                         || c.contains(":lock"))
             })],
         },

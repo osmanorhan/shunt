@@ -40,16 +40,40 @@ pub struct Message {
 
 impl Message {
     pub fn system(content: impl Into<String>) -> Self {
-        Self { role: Role::System, content: Some(content.into()), tool_calls: None, tool_call_id: None, name: None }
+        Self {
+            role: Role::System,
+            content: Some(content.into()),
+            tool_calls: None,
+            tool_call_id: None,
+            name: None,
+        }
     }
     pub fn user(content: impl Into<String>) -> Self {
-        Self { role: Role::User, content: Some(content.into()), tool_calls: None, tool_call_id: None, name: None }
+        Self {
+            role: Role::User,
+            content: Some(content.into()),
+            tool_calls: None,
+            tool_call_id: None,
+            name: None,
+        }
     }
     pub fn assistant_with_calls(tool_calls: Vec<ToolCallItem>) -> Self {
-        Self { role: Role::Assistant, content: None, tool_calls: Some(tool_calls), tool_call_id: None, name: None }
+        Self {
+            role: Role::Assistant,
+            content: None,
+            tool_calls: Some(tool_calls),
+            tool_call_id: None,
+            name: None,
+        }
     }
     pub fn tool_result(tool_call_id: String, name: String, content: String) -> Self {
-        Self { role: Role::Tool, content: Some(content), tool_calls: None, tool_call_id: Some(tool_call_id), name: Some(name) }
+        Self {
+            role: Role::Tool,
+            content: Some(content),
+            tool_calls: None,
+            tool_call_id: Some(tool_call_id),
+            name: Some(name),
+        }
     }
 }
 

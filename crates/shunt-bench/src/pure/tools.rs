@@ -11,20 +11,40 @@ pub struct ToolResult {
 
 impl ToolResult {
     pub fn ok(content: impl Into<String>) -> Self {
-        Self { content: content.into(), is_error: false }
+        Self {
+            content: content.into(),
+            is_error: false,
+        }
     }
     pub fn err(msg: impl Into<String>) -> Self {
-        Self { content: msg.into(), is_error: true }
+        Self {
+            content: msg.into(),
+            is_error: true,
+        }
     }
 }
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum ToolInvocation {
-    ListFiles { dir: Option<String> },
-    ReadFile { path: String },
-    Search { query: String },
-    EditFile { path: String, mode: EditMode, old: Option<String>, new: Option<String>, content: Option<String> },
-    Finish { summary: Option<String> },
+    ListFiles {
+        dir: Option<String>,
+    },
+    ReadFile {
+        path: String,
+    },
+    Search {
+        query: String,
+    },
+    EditFile {
+        path: String,
+        mode: EditMode,
+        old: Option<String>,
+        new: Option<String>,
+        content: Option<String>,
+    },
+    Finish {
+        summary: Option<String>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]
@@ -51,17 +71,28 @@ pub fn parse_invocation(name: &str, args: &Value) -> Result<ToolInvocation, Pars
         }
         "edit_file" => {
             let path = required_str(args, "path")?;
-            let mode: EditMode = serde_json::from_value(
-                args.get("mode").cloned().unwrap_or(Value::Null),
-            )
-            .map_err(|e| ParseError::SchemaMismatch(format!("invalid mode: {e}")))?;
+            let mode: EditMode =
+                serde_json::from_value(args.get("mode").cloned().unwrap_or(Value::Null))
+                    .map_err(|e| ParseError::SchemaMismatch(format!("invalid mode: {e}")))?;
             let old = args.get("old").and_then(|v| v.as_str()).map(String::from);
             let new = args.get("new").and_then(|v| v.as_str()).map(String::from);
-            let content = args.get("content").and_then(|v| v.as_str()).map(String::from);
-            Ok(ToolInvocation::EditFile { path, mode, old, new, content })
+            let content = args
+                .get("content")
+                .and_then(|v| v.as_str())
+                .map(String::from);
+            Ok(ToolInvocation::EditFile {
+                path,
+                mode,
+                old,
+                new,
+                content,
+            })
         }
         "finish" => {
-            let summary = args.get("summary").and_then(|v| v.as_str()).map(String::from);
+            let summary = args
+                .get("summary")
+                .and_then(|v| v.as_str())
+                .map(String::from);
             Ok(ToolInvocation::Finish { summary })
         }
         other => Err(ParseError::UnknownTool(other.to_string())),
@@ -108,7 +139,11 @@ pub fn dispatch(inv: &ToolInvocation, workspace: &Path) -> ToolResult {
                         .enumerate()
                         .map(|(i, l)| format!("{}: {}\n", i + 1, l))
                         .collect();
-                    ToolResult::ok(if numbered.is_empty() { "(empty file)".into() } else { numbered })
+                    ToolResult::ok(if numbered.is_empty() {
+                        "(empty file)".into()
+                    } else {
+                        numbered
+                    })
                 }
                 Err(e) => ToolResult::err(format!("error reading {path}: {e}")),
             }
@@ -122,7 +157,13 @@ pub fn dispatch(inv: &ToolInvocation, workspace: &Path) -> ToolResult {
                 ToolResult::ok(hits.join("\n"))
             }
         }
-        ToolInvocation::EditFile { path, mode, old, new, content } => {
+        ToolInvocation::EditFile {
+            path,
+            mode,
+            old,
+            new,
+            content,
+        } => {
             let full = workspace.join(path);
             match mode {
                 EditMode::StrReplace => {
@@ -135,7 +176,9 @@ pub fn dispatch(inv: &ToolInvocation, workspace: &Path) -> ToolResult {
                     match fs::read_to_string(&full) {
                         Ok(existing) => {
                             if !existing.contains(old.as_str()) {
-                                return ToolResult::err(format!("'old' string not found in {path}"));
+                                return ToolResult::err(format!(
+                                    "'old' string not found in {path}"
+                                ));
                             }
                             let updated = existing.replacen(old.as_str(), new.as_str(), 1);
                             match fs::write(&full, updated) {

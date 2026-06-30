@@ -87,17 +87,30 @@ pub struct LogEntry {
 
 #[derive(Debug, Clone)]
 pub enum LogKind {
-    ModelResponse { finish_reason: Option<String>, content_preview: Option<String> },
-    ToolCall { name: String, args_preview: String, result_preview: String, is_error: bool, valid: bool },
-    Stopped { reason: String },
+    ModelResponse {
+        finish_reason: Option<String>,
+        content_preview: Option<String>,
+    },
+    ToolCall {
+        name: String,
+        args_preview: String,
+        result_preview: String,
+        is_error: bool,
+        valid: bool,
+    },
+    Stopped {
+        reason: String,
+    },
 }
 
-pub fn run_loop(client: &ChatClient, cfg: &LoopConfig, task_request: &str, workspace: &Path) -> RunTrace {
+pub fn run_loop(
+    client: &ChatClient,
+    cfg: &LoopConfig,
+    task_request: &str,
+    workspace: &Path,
+) -> RunTrace {
     let schemas = tools::schemas();
-    let mut messages = vec![
-        Message::system(SYSTEM_PROMPT),
-        Message::user(task_request),
-    ];
+    let mut messages = vec![Message::system(SYSTEM_PROMPT), Message::user(task_request)];
 
     let mut turns = 0usize;
     let mut native_tool_turns = 0usize;
@@ -133,7 +146,12 @@ pub fn run_loop(client: &ChatClient, cfg: &LoopConfig, task_request: &str, works
             Ok(r) => r,
             Err(e) => {
                 let err = e.clone();
-                log.push(LogEntry { turn, kind: LogKind::Stopped { reason: format!("http_error: {e}") } });
+                log.push(LogEntry {
+                    turn,
+                    kind: LogKind::Stopped {
+                        reason: format!("http_error: {e}"),
+                    },
+                });
                 stop_reason = StopReason::HttpError(err);
                 break;
             }
@@ -147,13 +165,22 @@ pub fn run_loop(client: &ChatClient, cfg: &LoopConfig, task_request: &str, works
         let choice = match resp.choices.into_iter().next() {
             Some(c) => c,
             None => {
-                log.push(LogEntry { turn, kind: LogKind::Stopped { reason: "empty choices".into() } });
+                log.push(LogEntry {
+                    turn,
+                    kind: LogKind::Stopped {
+                        reason: "empty choices".into(),
+                    },
+                });
                 stop_reason = StopReason::HttpError("empty choices".into());
                 break;
             }
         };
 
-        let has_tool_calls = choice.message.tool_calls.as_ref().is_some_and(|t| !t.is_empty());
+        let has_tool_calls = choice
+            .message
+            .tool_calls
+            .as_ref()
+            .is_some_and(|t| !t.is_empty());
 
         log.push(LogEntry {
             turn,
@@ -170,7 +197,12 @@ pub fn run_loop(client: &ChatClient, cfg: &LoopConfig, task_request: &str, works
 
         if !has_tool_calls {
             stop_reason = StopReason::NoToolCalls;
-            log.push(LogEntry { turn, kind: LogKind::Stopped { reason: "no_tool_calls".into() } });
+            log.push(LogEntry {
+                turn,
+                kind: LogKind::Stopped {
+                    reason: "no_tool_calls".into(),
+                },
+            });
             break;
         }
 
@@ -211,9 +243,18 @@ pub fn run_loop(client: &ChatClient, cfg: &LoopConfig, task_request: &str, works
                             valid: true,
                         },
                     });
-                    messages.push(Message::tool_result(tc.id.clone(), tc.function.name.clone(), r.content));
+                    messages.push(Message::tool_result(
+                        tc.id.clone(),
+                        tc.function.name.clone(),
+                        r.content,
+                    ));
                     stop_reason = StopReason::Finished;
-                    log.push(LogEntry { turn, kind: LogKind::Stopped { reason: "finished".into() } });
+                    log.push(LogEntry {
+                        turn,
+                        kind: LogKind::Stopped {
+                            reason: "finished".into(),
+                        },
+                    });
                     break 'outer;
                 }
                 r
@@ -246,7 +287,12 @@ pub fn run_loop(client: &ChatClient, cfg: &LoopConfig, task_request: &str, works
     }
 
     if matches!(stop_reason, StopReason::TurnCap) {
-        log.push(LogEntry { turn: cfg.turn_cap, kind: LogKind::Stopped { reason: "turn_cap".into() } });
+        log.push(LogEntry {
+            turn: cfg.turn_cap,
+            kind: LogKind::Stopped {
+                reason: "turn_cap".into(),
+            },
+        });
     }
 
     RunTrace {
@@ -267,7 +313,12 @@ pub fn run_loop(client: &ChatClient, cfg: &LoopConfig, task_request: &str, works
     }
 }
 
-fn track_rw(inv: &ToolInvocation, had_read: &mut bool, had_edit: &mut bool, read_before_edit: &mut bool) {
+fn track_rw(
+    inv: &ToolInvocation,
+    had_read: &mut bool,
+    had_edit: &mut bool,
+    read_before_edit: &mut bool,
+) {
     match inv {
         ToolInvocation::ReadFile { .. } | ToolInvocation::Search { .. } => {
             *had_read = true;

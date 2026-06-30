@@ -21,13 +21,20 @@ pub struct PureTaskScore {
 
 impl PureTaskScore {
     pub fn successes(&self) -> usize {
-        self.runs.iter().filter(|r| r.outcome == Outcome::Success).count()
+        self.runs
+            .iter()
+            .filter(|r| r.outcome == Outcome::Success)
+            .count()
     }
     pub fn n(&self) -> usize {
         self.runs.len()
     }
     pub fn success_rate(&self) -> f32 {
-        if self.runs.is_empty() { 0.0 } else { self.successes() as f32 / self.n() as f32 }
+        if self.runs.is_empty() {
+            0.0
+        } else {
+            self.successes() as f32 / self.n() as f32
+        }
     }
     pub fn avg_turns(&self) -> f32 {
         avg(self.runs.iter().map(|r| r.turns as f32))
@@ -49,28 +56,38 @@ impl PureTaskScore {
 impl EntryScore {
     pub fn overall_rate(&self) -> f32 {
         let total: usize = self.task_scores.iter().map(|t| t.n()).sum();
-        if total == 0 { return 0.0; }
+        if total == 0 {
+            return 0.0;
+        }
         let ok: usize = self.task_scores.iter().map(|t| t.successes()).sum();
         ok as f32 / total as f32
     }
     pub fn avg_native_tool(&self) -> f32 {
         let runs: Vec<_> = self.task_scores.iter().flat_map(|t| &t.runs).collect();
-        if runs.is_empty() { return 0.0; }
+        if runs.is_empty() {
+            return 0.0;
+        }
         runs.iter().map(|r| r.native_tool_pct).sum::<f32>() / runs.len() as f32
     }
     pub fn avg_valid_args(&self) -> f32 {
         let runs: Vec<_> = self.task_scores.iter().flat_map(|t| &t.runs).collect();
-        if runs.is_empty() { return 1.0; }
+        if runs.is_empty() {
+            return 1.0;
+        }
         runs.iter().map(|r| r.valid_args_pct).sum::<f32>() / runs.len() as f32
     }
     pub fn avg_turns(&self) -> f32 {
         let runs: Vec<_> = self.task_scores.iter().flat_map(|t| &t.runs).collect();
-        if runs.is_empty() { return 0.0; }
+        if runs.is_empty() {
+            return 0.0;
+        }
         runs.iter().map(|r| r.turns as f32).sum::<f32>() / runs.len() as f32
     }
     pub fn avg_secs(&self) -> f32 {
         let runs: Vec<_> = self.task_scores.iter().flat_map(|t| &t.runs).collect();
-        if runs.is_empty() { return 0.0; }
+        if runs.is_empty() {
+            return 0.0;
+        }
         runs.iter().map(|r| r.wall_secs).sum::<f32>() / runs.len() as f32
     }
     pub fn entry_label(&self) -> String {
@@ -157,17 +174,35 @@ pub fn write_run_log(
     let path = dir.join(format!("{}-run-{run_idx}.md", safe_name(task.name)));
 
     let mut log = String::new();
-    log.push_str(&format!("# {} / {} / run {}\n\n", entry.entry_label(), task.name, run_idx));
+    log.push_str(&format!(
+        "# {} / {} / run {}\n\n",
+        entry.entry_label(),
+        task.name,
+        run_idx
+    ));
     log.push_str(&format!("- difficulty: {}\n", task.difficulty.label()));
-    log.push_str(&format!("- outcome: {:?} `{}`\n", metrics.outcome, metrics.outcome.glyph()));
+    log.push_str(&format!(
+        "- outcome: {:?} `{}`\n",
+        metrics.outcome,
+        metrics.outcome.glyph()
+    ));
     log.push_str(&format!("- stop_reason: {}\n", metrics.stop_reason));
     log.push_str(&format!("- turns: {}\n", metrics.turns));
-    log.push_str(&format!("- native_tool: {}\n", pct(metrics.native_tool_pct)));
+    log.push_str(&format!(
+        "- native_tool: {}\n",
+        pct(metrics.native_tool_pct)
+    ));
     log.push_str(&format!("- valid_args: {}\n", pct(metrics.valid_args_pct)));
     log.push_str(&format!("- unknown_tool: {}\n", metrics.unknown_tool_count));
-    log.push_str(&format!("- schema_mismatch: {}\n", metrics.schema_mismatch_count));
+    log.push_str(&format!(
+        "- schema_mismatch: {}\n",
+        metrics.schema_mismatch_count
+    ));
     log.push_str(&format!("- thrash: {}\n", metrics.thrash));
-    log.push_str(&format!("- read_before_edit: {}\n", metrics.read_before_edit));
+    log.push_str(&format!(
+        "- read_before_edit: {}\n",
+        metrics.read_before_edit
+    ));
     log.push_str(&format!("- total_tokens: {}\n", metrics.total_tokens));
     log.push_str(&format!("- wall_secs: {:.1}\n", metrics.wall_secs));
 
@@ -176,21 +211,35 @@ pub fn write_run_log(
 
     log.push_str("\n\n## Checked Files\n\n");
     for (rel, content, passed) in file_snapshots {
-        log.push_str(&format!("### `{rel}` (check_passed: `{passed}`)\n\n```\n{content}```\n\n"));
+        log.push_str(&format!(
+            "### `{rel}` (check_passed: `{passed}`)\n\n```\n{content}```\n\n"
+        ));
     }
 
     log.push_str("## Tool Call Log\n\n");
     for entry in &trace.log {
         match &entry.kind {
-            LogKind::ModelResponse { finish_reason, content_preview } => {
+            LogKind::ModelResponse {
+                finish_reason,
+                content_preview,
+            } => {
                 log.push_str(&format!(
                     "**turn {}** model response (finish_reason={:?}){}\n\n",
                     entry.turn,
                     finish_reason,
-                    content_preview.as_ref().map(|c| format!(": `{c}`")).unwrap_or_default(),
+                    content_preview
+                        .as_ref()
+                        .map(|c| format!(": `{c}`"))
+                        .unwrap_or_default(),
                 ));
             }
-            LogKind::ToolCall { name, args_preview, result_preview, is_error, valid } => {
+            LogKind::ToolCall {
+                name,
+                args_preview,
+                result_preview,
+                is_error,
+                valid,
+            } => {
                 let status = if *is_error { "err" } else { "ok" };
                 let validity = if *valid { "" } else { " [INVALID]" };
                 log.push_str(&format!(
@@ -208,7 +257,11 @@ pub fn write_run_log(
 
 fn avg(iter: impl Iterator<Item = f32>) -> f32 {
     let v: Vec<f32> = iter.collect();
-    if v.is_empty() { 0.0 } else { v.iter().sum::<f32>() / v.len() as f32 }
+    if v.is_empty() {
+        0.0
+    } else {
+        v.iter().sum::<f32>() / v.len() as f32
+    }
 }
 
 fn pct(r: f32) -> String {
@@ -217,6 +270,12 @@ fn pct(r: f32) -> String {
 
 pub fn safe_name(name: &str) -> String {
     name.chars()
-        .map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' { c } else { '-' })
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '-'
+            }
+        })
         .collect()
 }

@@ -56,7 +56,11 @@ fn classify(trace: &RunTrace, passed: bool) -> Outcome {
     match &trace.stop_reason {
         StopReason::TurnCap | StopReason::HttpError(_) => Outcome::NotCompleted,
         StopReason::Finished | StopReason::NoToolCalls => {
-            if trace.had_edit { Outcome::WrongEdit } else { Outcome::NoEdit }
+            if trace.had_edit {
+                Outcome::WrongEdit
+            } else {
+                Outcome::NoEdit
+            }
         }
     }
 }
