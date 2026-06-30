@@ -700,7 +700,12 @@ impl TaskRuntime {
             return Ok(None);
         };
 
-        let agent_context = load_agent_context(&self.store, &artifact.task_id.0);
+        let agent_context = load_agent_context_with_knowledge(
+            &self.store,
+            &artifact.task_id.0,
+            &self.knowledge,
+            &artifact,
+        );
         let output = ClarifyNode::new(provider)
             .with_agent_context(agent_context)
             .run(&artifact)?;
@@ -712,7 +717,12 @@ impl TaskRuntime {
             tracing::debug!(
                 "clarify_task: resolved {resolved} lookup ambiguity/ambiguities, re-running clarify"
             );
-            let agent_context2 = load_agent_context(&self.store, &artifact.task_id.0);
+            let agent_context2 = load_agent_context_with_knowledge(
+                &self.store,
+                &artifact.task_id.0,
+                &self.knowledge,
+                &artifact,
+            );
             let output2 = ClarifyNode::new(provider)
                 .with_agent_context(agent_context2)
                 .run(&artifact)?;
@@ -855,7 +865,12 @@ impl TaskRuntime {
             return Ok(None);
         };
 
-        let agent_context = load_agent_context(&self.store, &artifact.task_id.0);
+        let agent_context = load_agent_context_with_knowledge(
+            &self.store,
+            &artifact.task_id.0,
+            &self.knowledge,
+            &artifact,
+        );
         let output = UnderstandNode::new(provider)
             .with_agent_context(agent_context)
             .run(&artifact)?;
@@ -1228,14 +1243,16 @@ impl TaskRuntime {
                     let cs = build_change_set(ops, setup_commands);
                     let diagnostics = collect_repair_diagnostics(
                         provider,
-                        &task.workspace_root,
-                        &artifact,
-                        &cs,
-                        &done_file_state,
-                        baseline_errors.as_ref(),
-                        extra_ignore_patterns,
-                        self.budget_override.as_ref(),
-                        self.agent_observer.clone(),
+                        RepairDiagnosticContext {
+                            workspace_root: &task.workspace_root,
+                            artifact: &artifact,
+                            change_set: &cs,
+                            done_file_state: &done_file_state,
+                            baseline_error: baseline_errors.as_ref(),
+                            extra_ignore_patterns,
+                            budget_override: self.budget_override.as_ref(),
+                            observer: self.agent_observer.clone(),
+                        },
                     )?;
 
                     if !diagnostics.is_empty() {
@@ -1785,6 +1802,22 @@ fn load_agent_context(store: &SqliteStore, task_id: &str) -> String {
     AgentFrame::from_ledger(&ledger, 10, AgentBudget::default()).format_context()
 }
 
+fn load_agent_context_with_knowledge(
+    store: &SqliteStore,
+    task_id: &str,
+    knowledge: &KnowledgeService,
+    artifact: &UnderstandingArtifact,
+) -> String {
+    let ledger_context = load_agent_context(store, task_id);
+    let knowledge_context = knowledge.agent_context(artifact);
+    match (ledger_context.is_empty(), knowledge_context.is_empty()) {
+        (true, true) => String::new(),
+        (false, true) => ledger_context,
+        (true, false) => knowledge_context,
+        (false, false) => format!("{ledger_context}\n\n{knowledge_context}"),
+    }
+}
+
 fn execution_request(artifact: &UnderstandingArtifact) -> String {
     let contract = contract_prompt_section(artifact);
     if contract.is_empty() {
@@ -1976,18 +2009,32 @@ fn workspace_check(workspace_root: &str) -> Option<RepairDiagnostic> {
     None
 }
 
-#[allow(clippy::too_many_arguments)]
+struct RepairDiagnosticContext<'a> {
+    workspace_root: &'a str,
+    artifact: &'a UnderstandingArtifact,
+    change_set: &'a ChangeSet,
+    done_file_state: &'a std::collections::HashMap<String, String>,
+    baseline_error: Option<&'a RepairDiagnostic>,
+    extra_ignore_patterns: &'a [String],
+    budget_override: Option<&'a shunt_infer::SessionBudgetOverride>,
+    observer: Option<Arc<dyn AgentObserver + Send + Sync>>,
+}
+
 fn collect_repair_diagnostics<P: ToolProvider>(
     provider: &P,
-    workspace_root: &str,
-    artifact: &UnderstandingArtifact,
-    change_set: &ChangeSet,
-    done_file_state: &std::collections::HashMap<String, String>,
-    baseline_error: Option<&RepairDiagnostic>,
-    extra_ignore_patterns: &[String],
-    budget_override: Option<&shunt_infer::SessionBudgetOverride>,
-    observer: Option<Arc<dyn AgentObserver + Send + Sync>>,
+    ctx: RepairDiagnosticContext<'_>,
 ) -> RuntimeResult<Vec<RepairDiagnostic>> {
+    let RepairDiagnosticContext {
+        workspace_root,
+        artifact,
+        change_set,
+        done_file_state,
+        baseline_error,
+        extra_ignore_patterns,
+        budget_override,
+        observer,
+    } = ctx;
+
     let projected = tempfile::tempdir()?;
     let projected_root = projected.path().join("workspace");
     copy_workspace_tree(Path::new(workspace_root), &projected_root)?;
@@ -3698,10 +3745,12 @@ fn relative_locator(workspace_root: &Path, path: &Path) -> String {
 mod tests {
     use std::fs;
     use std::path::PathBuf;
+    use std::sync::{Arc, Mutex};
 
     use shunt_core::{
         ApprovalStatus, CandidateFile, ChangeSet, CorrectionKind, EvidenceKind, EvidenceRef,
-        ExecutionStageKind, FileOp, FrontierReason, FrontierStatus, RecipeRef, RequiredPath,
+        ExecutionStageKind, FileOp, FrontierReason, FrontierStatus, ManualEvidence,
+        ManualVersionStatus, PackageFact, PackageVersionProvenance, RecipeRef, RequiredPath,
         RequiredPathIntent, StageStatus, TaskPhase, UncertaintyEvent, UncertaintyKind,
         VerifierStatus, WorkContract,
     };
@@ -3928,22 +3977,28 @@ mod tests {
             )
             .unwrap();
 
+        let workspace_root = root.display().to_string();
+        let change_set = ChangeSet {
+            ops: vec![],
+            commands: vec![shunt_core::CommandSpec::new(
+                "definitely-not-a-real-command",
+                std::iter::empty::<&str>(),
+            )],
+        };
+        let file_state = std::collections::HashMap::new();
+
         let diagnostics = super::collect_repair_diagnostics(
             &StubProvider,
-            &root.display().to_string(),
-            &artifact,
-            &ChangeSet {
-                ops: vec![],
-                commands: vec![shunt_core::CommandSpec::new(
-                    "definitely-not-a-real-command",
-                    std::iter::empty::<&str>(),
-                )],
+            super::RepairDiagnosticContext {
+                workspace_root: &workspace_root,
+                artifact: &artifact,
+                change_set: &change_set,
+                done_file_state: &file_state,
+                baseline_error: None,
+                extra_ignore_patterns: &[],
+                budget_override: None,
+                observer: None,
             },
-            &std::collections::HashMap::new(),
-            None,
-            &[],
-            None,
-            None,
         )
         .unwrap();
 
@@ -4048,6 +4103,93 @@ mod tests {
         assert_eq!(saved_task.phase, TaskPhase::Agree);
         assert_eq!(saved_task.frontier_cases.len(), 1);
         assert_eq!(saved_artifact.approval.status, ApprovalStatus::Draft);
+    }
+
+    #[test]
+    fn understand_provider_receives_rendered_knowledge_context() {
+        let root = unique_temp_dir("runtime-knowledge-context");
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::write(root.join("src/lib.rs"), "pub fn render() {}\n").unwrap();
+
+        let store = SqliteStore::open_in_memory().unwrap();
+        let runtime = TaskRuntime::new(store);
+        let now = datetime!(2026-05-01 12:00 UTC);
+        let (_, mut artifact) = runtime
+            .start_task(
+                now,
+                "task-knowledge-context",
+                "artifact-knowledge-context",
+                root.display().to_string(),
+                "fix ratatui layout rendering",
+            )
+            .unwrap();
+        artifact.target_scope = vec!["src/lib.rs".into()];
+        artifact.package_facts = vec![PackageFact {
+            ecosystem: "cargo".into(),
+            name: "ratatui".into(),
+            version: Some("0.29.0".into()),
+            requirement: Some("0.29".into()),
+            version_provenance: PackageVersionProvenance::ExactLock,
+            manifest_path: "Cargo.toml".into(),
+            evidence: vec![],
+            confidence: 0.95,
+        }];
+        artifact.manual_evidence = vec![ManualEvidence {
+            ecosystem: "cargo".into(),
+            package: "ratatui".into(),
+            version: Some("0.29.0".into()),
+            version_status: ManualVersionStatus::Exact,
+            source: "manual-catalog".into(),
+            locator: "ratatui/layout".into(),
+            title: Some("Layout".into()),
+            excerpt: "Use the Layout API to split terminal areas.".into(),
+            relevance_reason: "matched layout".into(),
+            confidence: 0.9,
+        }];
+        runtime.store.put_understanding_artifact(&artifact).unwrap();
+
+        let captured_user = Arc::new(Mutex::new(None));
+        let provider = CapturingUnderstandProvider {
+            captured_user: captured_user.clone(),
+        };
+
+        runtime
+            .understand_task_with_provider("artifact-knowledge-context", now, &provider)
+            .unwrap();
+
+        let prompt = captured_user.lock().unwrap().clone().unwrap();
+        assert!(prompt.contains("KNOWLEDGE CONTEXT"));
+        assert!(prompt.contains("cargo:ratatui@0.29.0"));
+        assert!(prompt.contains("Exact manual"));
+        assert!(prompt.contains("Use the Layout API"));
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    struct CapturingUnderstandProvider {
+        captured_user: Arc<Mutex<Option<String>>>,
+    }
+
+    impl ToolProvider for CapturingUnderstandProvider {
+        fn call_tool(
+            &self,
+            _system: &str,
+            user: &str,
+            tool: &ToolSpec,
+        ) -> shunt_infer::InferResult<ToolCall> {
+            *self.captured_user.lock().unwrap() = Some(user.to_string());
+            Ok(ToolCall {
+                name: tool.name.clone(),
+                arguments: serde_json::json!({
+                    "interpreted_goal": "fix ratatui layout rendering",
+                    "success_criteria": ["layout rendering is fixed"],
+                    "target_scope": ["src/lib.rs"],
+                    "ambiguities": [],
+                    "risks": [],
+                    "confidence": 0.82
+                }),
+            })
+        }
     }
 
     struct StubProvider;
