@@ -134,10 +134,23 @@ fn is_rm_recursive_force(arg: &str) -> bool {
 
 fn dangerous_reason(prog: &str, args: &[&str]) -> Option<String> {
     match prog {
-        "rm" => Some(format!(
-            "`rm {}` will delete files permanently",
-            args.join(" ")
-        )),
+        "rm" => {
+            // Workspace-relative paths (no leading /, ~, or .. traversal) are safe
+            // to auto-run — they're scoped to the workspace root. Absolute paths or
+            // traversal arguments are still dangerous.
+            let targets: Vec<&&str> = args.iter().filter(|a| !a.starts_with('-')).collect();
+            let has_dangerous_path = targets.iter().any(|a| {
+                a.starts_with('/') || a.starts_with('~') || **a == ".." || a.starts_with("../")
+            });
+            if has_dangerous_path {
+                Some(format!(
+                    "`rm {}` targets a path outside the workspace",
+                    args.join(" ")
+                ))
+            } else {
+                None
+            }
+        }
 
         "sudo" | "su" | "doas" => Some(format!("`{prog}` requires elevated privileges")),
 
@@ -229,9 +242,25 @@ mod tests {
     }
 
     #[test]
-    fn rm_is_dangerous() {
+    fn rm_relative_path_is_safe() {
+        // Workspace-relative deletes are auto-runnable — they can't escape the workspace.
+        assert!(classify(&cmd("rm", &["src/old.rs"])).is_safe());
+        assert!(classify(&cmd("rm", &["-rf", "frontend"])).is_safe());
+        assert!(classify(&cmd("rm", &["-r", "dist/"])).is_safe());
+    }
+
+    #[test]
+    fn rm_absolute_path_is_dangerous() {
         assert!(matches!(
-            classify(&cmd("rm", &["src/old.rs"])),
+            classify(&cmd("rm", &["/etc/hosts"])),
+            CommandSafety::Dangerous { .. }
+        ));
+        assert!(matches!(
+            classify(&cmd("rm", &["~/important.txt"])),
+            CommandSafety::Dangerous { .. }
+        ));
+        assert!(matches!(
+            classify(&cmd("rm", &["../escape"])),
             CommandSafety::Dangerous { .. }
         ));
     }

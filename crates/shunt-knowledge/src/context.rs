@@ -5,8 +5,8 @@ use shunt_core::{
     UnderstandingArtifact,
 };
 
-const MAX_PACKAGES: usize = 5;
-const MAX_MANUALS_PER_PACKAGE: usize = 2;
+const MAX_PACKAGES: usize = 3;
+const MAX_MANUALS_PER_PACKAGE: usize = 1;
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct KnowledgeContext {
@@ -60,6 +60,31 @@ impl KnowledgeContext {
             })
             .collect::<Vec<_>>();
 
+        let existing = packages
+            .iter()
+            .map(|package| (package.ecosystem.clone(), package.name.clone()))
+            .collect::<std::collections::BTreeSet<_>>();
+        for ((ecosystem, name), manuals) in &manuals_by_package {
+            if existing.contains(&(ecosystem.clone(), name.clone())) {
+                continue;
+            }
+            packages.push(KnowledgePackageContext {
+                ecosystem: ecosystem.clone(),
+                name: name.clone(),
+                version: manuals
+                    .first()
+                    .and_then(|manual| manual.locator.split('@').nth(1))
+                    .map(str::to_string),
+                requirement: None,
+                version_provenance: PackageVersionProvenance::Unknown,
+                confidence: manuals
+                    .iter()
+                    .map(|manual| manual.confidence)
+                    .fold(0.35, f32::max),
+                manuals: manuals.clone(),
+            });
+        }
+
         packages.sort_by(|left, right| {
             right
                 .manuals
@@ -83,7 +108,9 @@ impl KnowledgeContext {
         }
 
         let mut out = String::from("KNOWLEDGE CONTEXT:\n");
-        out.push_str("Use these version-aware facts as authoritative when they match repository evidence. Ignore conflicting generic examples.\n");
+        out.push_str(
+            "Follow these package-specific facts when editing code. Prefer the listed patterns over generic examples.\n",
+        );
         for package in &self.packages {
             out.push_str("- ");
             out.push_str(&package.package_line());
@@ -107,13 +134,8 @@ impl KnowledgePackageContext {
             .map(|requirement| format!(", requirement {requirement}"))
             .unwrap_or_default();
         format!(
-            "{}:{}@{} ({:?}{}, confidence {:.2})",
-            self.ecosystem,
-            self.name,
-            version,
-            self.version_provenance,
-            requirement,
-            self.confidence
+            "{}:{}@{} ({:?}{})",
+            self.ecosystem, self.name, version, self.version_provenance, requirement
         )
     }
 }
@@ -126,9 +148,20 @@ impl KnowledgeManualContext {
             .map(|title| format!("{title}: "))
             .unwrap_or_default();
         format!(
-            "{:?} manual {}{} [{}:{}] confidence {:.2}",
-            self.version_status, title, self.excerpt, self.source, self.locator, self.confidence
+            "Prefer this {} guidance: {}{}",
+            version_status_label(self.version_status),
+            title,
+            self.excerpt
         )
+    }
+}
+
+fn version_status_label(status: ManualVersionStatus) -> &'static str {
+    match status {
+        ManualVersionStatus::Exact => "exact",
+        ManualVersionStatus::CompatibleRange => "compatible",
+        ManualVersionStatus::Unversioned => "unversioned",
+        ManualVersionStatus::Mismatch => "mismatched",
     }
 }
 
@@ -238,7 +271,7 @@ mod tests {
 
         assert!(rendered.contains("KNOWLEDGE CONTEXT"));
         assert!(rendered.contains("cargo:ratatui@0.29.0"));
-        assert!(rendered.contains("Exact manual"));
+        assert!(rendered.contains("Prefer this exact guidance"));
         assert!(rendered.contains("Use the Layout API"));
     }
 
@@ -287,6 +320,78 @@ mod tests {
 
         assert!(rendered.contains("versioned docs"));
         assert!(!rendered.contains("generic docs"));
+    }
+
+    #[test]
+    fn renders_manual_only_packages_without_local_package_facts() {
+        let context = KnowledgeContext::from_evidence(
+            &[],
+            &[ManualEvidence {
+                ecosystem: "npm".into(),
+                package: "react".into(),
+                version: None,
+                version_status: ManualVersionStatus::Unversioned,
+                source: "public-search".into(),
+                locator: "https://react.dev/learn/installation".into(),
+                title: Some("Installation".into()),
+                excerpt: "Use create-vite or a framework such as Next.js for new React apps."
+                    .into(),
+                relevance_reason: "package react was named in the request".into(),
+                confidence: 0.82,
+            }],
+        );
+
+        let rendered = context.render_agent_context();
+
+        assert!(rendered.contains("npm:react@unknown"));
+        assert!(rendered.contains("create-vite"));
+    }
+
+    #[test]
+    fn omits_mismatched_manuals_from_rendered_context() {
+        let context = KnowledgeContext::from_evidence(
+            &[PackageFact {
+                ecosystem: "cargo".into(),
+                name: "ratatui".into(),
+                version: Some("0.29.0".into()),
+                requirement: Some("0.29".into()),
+                version_provenance: PackageVersionProvenance::ExactLock,
+                manifest_path: "Cargo.toml".into(),
+                evidence: vec![],
+                confidence: 0.9,
+            }],
+            &[
+                ManualEvidence {
+                    ecosystem: "cargo".into(),
+                    package: "ratatui".into(),
+                    version: Some("0.28.0".into()),
+                    version_status: ManualVersionStatus::Mismatch,
+                    source: "docs".into(),
+                    locator: "ratatui/0.28/layout".into(),
+                    title: Some("Old Layout".into()),
+                    excerpt: "Do not use this old layout pattern.".into(),
+                    relevance_reason: "mismatch".into(),
+                    confidence: 0.95,
+                },
+                ManualEvidence {
+                    ecosystem: "cargo".into(),
+                    package: "ratatui".into(),
+                    version: Some("0.29.0".into()),
+                    version_status: ManualVersionStatus::Exact,
+                    source: "docs".into(),
+                    locator: "ratatui/0.29/layout".into(),
+                    title: Some("Layout".into()),
+                    excerpt: "Use Layout::vertical([Constraint::Length(3), Constraint::Min(0)]).split(area).".into(),
+                    relevance_reason: "exact".into(),
+                    confidence: 0.9,
+                },
+            ],
+        );
+
+        let rendered = context.render_agent_context();
+
+        assert!(rendered.contains("Layout::vertical"));
+        assert!(!rendered.contains("Old Layout"));
     }
 
     fn artifact(
