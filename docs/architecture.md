@@ -69,11 +69,11 @@ The actor passes `Command`s and `MachineEvent`s through `TaskMachine::transition
 During `ProposeChange`, `AgentSession` runs a tool-use loop:
 
 1. Model receives workspace context — search results, file excerpts, task description
-2. Model calls a tool: `read_file`, `search_files`, `replace_lines`, `write_file`, `delete_file`, `run_command`, `ask_user`, or `done`
+2. Model calls a tool: `read_file`, `search_files`, `edit`, `command`, `knowledge` (when a backend is wired), `ask_user`, or `done`
 3. Tool result is returned to the model
 4. Loop continues until `done` is called or the turn budget is reached
 
-Tool calls use grammar-constrained JSON schema decoding, so the model produces valid structured output on every turn.
+The tool set is defined once in a registry (`TOOLS` in `agent.rs`) that drives both the action schema and the system-prompt tool reference, so they cannot drift. `edit` creates a new file (no `start_line`) or modifies an existing one by line range (`start_line`/`end_line`); file deletion is done via `command` (`rm`). On OpenAI-compatible servers, `shunt-infer` sends strict native function tools and serializes prior turns as `assistant.tool_calls` plus `tool` results so the wire format stays aligned with the OpenAI tool-calling contract.
 
 ---
 

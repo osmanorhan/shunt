@@ -191,11 +191,12 @@ impl<P: ToolProvider + Clone + Send + Sync + 'static> EffectRunner<P> {
                         &ignore_patterns,
                     ) {
                         // Agent asked the developer a question → pause, don't fail.
-                        if let RuntimeError::AgentNeedsClarification { question, .. } = &err {
+                        if let RuntimeError::AgentNeedsClarification { question, context } = &err {
                             let _ = tx_clone.blocking_send(RunnerMessage::Event(
                                 MachineEvent::AgentAsked {
                                     ambiguity_id: "agent-question".into(),
                                     question: question.clone(),
+                                    context: context.clone(),
                                     options: vec![],
                                 },
                             ));
@@ -240,6 +241,7 @@ impl<P: ToolProvider + Clone + Send + Sync + 'static> EffectRunner<P> {
                             None => (vec![], vec![], vec![], "no ops".into(), vec![]),
                         }
                     };
+                    let command_count = cmds_display.len();
                     let _ = tx_clone.blocking_send(RunnerMessage::Notification(
                         Notification::ChangeProposed {
                             description,
@@ -268,6 +270,117 @@ impl<P: ToolProvider + Clone + Send + Sync + 'static> EffectRunner<P> {
                         tx_clone.blocking_send(RunnerMessage::Event(MachineEvent::ProposalReady {
                             confidence,
                             op_count: op_paths.len(),
+                            command_count,
+                            snapshot,
+                        }));
+                });
+            }
+
+            Effect::ResumeAgent {
+                artifact_id,
+                question_id: _,
+                answer,
+            } => {
+                let provider = Arc::clone(&self.provider);
+                let store_path = self.store_path.clone();
+                let ignore_patterns = self.ignore_patterns.clone();
+                let workspace_root = workspace_root.clone();
+                let tx_clone = tx.clone();
+                tokio::task::spawn_blocking(move || {
+                    use shunt_core::FileOp;
+                    use shunt_core::machine::{ArtifactSnapshot, FileDiff};
+                    let mut rt = match open_runtime(&store_path) {
+                        Ok(rt) => rt,
+                        Err(err) => {
+                            warn!(%err, "ResumeAgent open_runtime");
+                            runner_err(&tx_clone, "ResumeAgent", err.to_string());
+                            return;
+                        }
+                    };
+                    rt.set_agent_observer(Arc::new(TxAgentObserver {
+                        tx: tx_clone.clone(),
+                    }));
+                    let now = time::OffsetDateTime::now_utc();
+                    if let Err(err) =
+                        rt.resume_agent(&task_id, now, provider.as_ref(), &answer, &ignore_patterns)
+                    {
+                        if let RuntimeError::AgentNeedsClarification { question, context } = &err {
+                            let _ = tx_clone.blocking_send(RunnerMessage::Event(
+                                MachineEvent::AgentAsked {
+                                    ambiguity_id: "agent-question".into(),
+                                    question: question.clone(),
+                                    context: context.clone(),
+                                    options: vec![],
+                                },
+                            ));
+                            return;
+                        }
+                        warn!(%err, "ResumeAgent resume_agent");
+                        runner_err(&tx_clone, "ResumeAgent", err.to_string());
+                        return;
+                    }
+
+                    let (op_strs, op_paths, cmds_display, description, diffs) = {
+                        let task = rt.store.get_task_run(&task_id).ok().flatten();
+                        let change_set = task
+                            .as_ref()
+                            .and_then(|t| rt.load_active_recipe_run(t).ok())
+                            .and_then(|r| r.change_set);
+                        match change_set {
+                            Some(cs) => {
+                                let strs: Vec<String> = cs
+                                    .ops
+                                    .iter()
+                                    .map(|op| match op {
+                                        FileOp::Create { path, .. } => format!("create {path}"),
+                                        FileOp::Edit { path, .. } => format!("edit {path}"),
+                                        FileOp::Delete { path } => format!("delete {path}"),
+                                    })
+                                    .collect();
+                                let paths: Vec<String> =
+                                    cs.ops.iter().map(|op| op.path().to_string()).collect();
+                                let cmds: Vec<String> =
+                                    cs.commands.iter().map(|c| c.display()).collect();
+                                let desc = format!("{} op(s)", strs.len());
+                                let diffs: Vec<FileDiff> = cs
+                                    .ops
+                                    .iter()
+                                    .map(|op| compute_file_diff(op, &workspace_root))
+                                    .collect();
+                                (strs, paths, cmds, desc, diffs)
+                            }
+                            None => (vec![], vec![], vec![], "no ops".into(), vec![]),
+                        }
+                    };
+                    let command_count = cmds_display.len();
+                    let _ = tx_clone.blocking_send(RunnerMessage::Notification(
+                        Notification::ChangeProposed {
+                            description,
+                            ops: op_strs,
+                            commands: cmds_display,
+                            diffs,
+                        },
+                    ));
+
+                    let artifact = rt
+                        .store
+                        .get_understanding_artifact(&artifact_id.0)
+                        .ok()
+                        .flatten();
+                    let confidence = artifact.as_ref().map(|a| a.confidence).unwrap_or(0.0);
+                    let snapshot = ArtifactSnapshot {
+                        interpreted_goal: artifact.map(|a| a.interpreted_goal).unwrap_or_default(),
+                        confidence,
+                        evidence_count: 0,
+                        candidate_paths: op_paths.clone(),
+                        open_ambiguity_count: 0,
+                        open_risks: vec![],
+                    };
+                    let _ =
+                        tx_clone.blocking_send(RunnerMessage::Event(MachineEvent::ProposalReady {
+                            confidence,
+                            op_count: op_paths.len(),
+                            command_count,
                             snapshot,
                         }));
                 });
@@ -330,13 +443,6 @@ impl<P: ToolProvider + Clone + Send + Sync + 'static> EffectRunner<P> {
                             return;
                         }
                     };
-
-                    // Auto-format changed files (rustfmt / prettier). Best-effort.
-                    if let Some(cs) = &run.change_set {
-                        let changed_paths: Vec<String> =
-                            cs.ops.iter().map(|op| op.path().to_string()).collect();
-                        auto_format_files(&workspace_root, &changed_paths);
-                    }
 
                     // Record the change in the ledger.
                     {
@@ -1002,38 +1108,6 @@ fn unified_diff(old: &str, new: &str, ctx: usize) -> Vec<shunt_core::machine::Di
         last_included = Some(k);
     }
     result
-}
-
-/// Run rustfmt or prettier on each changed file. Non-fatal — logs on failure.
-fn auto_format_files(workspace_root: &str, paths: &[String]) {
-    for path in paths {
-        let abs = std::path::Path::new(workspace_root).join(path);
-        if !abs.is_file() {
-            continue;
-        }
-        let ext = abs.extension().and_then(|e| e.to_str()).unwrap_or("");
-        match ext {
-            "rs" => {
-                let out = std::process::Command::new("rustfmt")
-                    .arg("--edition=2021")
-                    .arg(&abs)
-                    .output();
-                if let Err(e) = out {
-                    warn!(path, %e, "rustfmt failed");
-                }
-            }
-            "ts" | "tsx" | "js" | "jsx" | "json" | "css" | "scss" | "html" => {
-                let out = std::process::Command::new("npx")
-                    .args(["--yes", "prettier", "--write", &abs.to_string_lossy()])
-                    .current_dir(workspace_root)
-                    .output();
-                if let Err(e) = out {
-                    warn!(path, %e, "prettier failed");
-                }
-            }
-            _ => {}
-        }
-    }
 }
 
 /// Append one ledger entry for `task_id`.  Non-fatal: logs a warning on error.

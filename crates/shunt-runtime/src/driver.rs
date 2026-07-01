@@ -66,6 +66,16 @@ impl Responder for AutoResponder {
                     answer: self.answer.clone(),
                 }
             }
+            UserRequest::AgentQuestion { question_id, .. } => {
+                if self.answers_given >= self.max_answers {
+                    return Command::Cancel;
+                }
+                self.answers_given += 1;
+                Command::Answer {
+                    ambiguity_id: question_id.clone(),
+                    answer: self.answer.clone(),
+                }
+            }
             UserRequest::Approval { .. } => Command::Approve,
             UserRequest::DangerousCommands { .. } => {
                 if self.approve_dangerous {
@@ -129,6 +139,17 @@ impl Responder for ScriptedResponder {
                     },
                 }
             }
+            UserRequest::AgentQuestion { question_id, .. } => match self.answers.pop_front() {
+                Some(answer) => Command::Answer {
+                    ambiguity_id: question_id.clone(),
+                    answer,
+                },
+                None if self.exhausted_cancels => Command::Cancel,
+                None => Command::Answer {
+                    ambiguity_id: question_id.clone(),
+                    answer: self.fallback.clone(),
+                },
+            },
             UserRequest::Approval { .. } => {
                 if self.approve_plan {
                     Command::Approve

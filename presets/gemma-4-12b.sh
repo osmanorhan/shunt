@@ -19,17 +19,24 @@ set -euo pipefail
 
 PORT="${PORT:-8080}"
 CTX="${CTX:-16384}"
+
+# Force the process to only see the first GPU (safest single-card method)
+export CUDA_VISIBLE_DEVICES=1
+
 if [ -n "${MODEL:-}" ]; then
     model_args=(--model "$MODEL")
 else
     model_args=(-hf "unsloth/gemma-4-12B-it-qat-GGUF:UD-Q4_K_XL")
 fi
+
 exec ~/llama.cpp/build/bin/llama-server \
-    "${model_args[@]}" \
+  "${model_args[@]}" \
   --alias "gemma-4-12b" \
   --port "$PORT" \
   --ctx-size "$CTX" \
   --threads -1 \
   --flash-attn on \
   --jinja \
-  --host 0.0.0.0
+  --host 0.0.0.0 \
+  --cont-batching \
+  --no-context-shift

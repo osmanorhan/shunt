@@ -13,154 +13,178 @@
 //! - `ask_user` pauses the loop and returns `NeedsClarification`.  The caller
 //!   serialises the session state, surfaces the question to the user, and
 //!   calls `AgentSession::resume` with the answer.
-//! - `sub_agent` spawns a depth-1 session (no ask_user / sub_agent) for
-//!   focused research or editing.  Its file edits and ops are merged back
-//!   into the parent session after it completes.
+//! - `knowledge` queries an injected `KnowledgeLookup` backend for dependency/version evidence.
 //! - `search_files` uses the shunt-localize search index when available; falls back
 //!   to a simple directory walk otherwise.
 
 use std::collections::{HashMap, HashSet};
-use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
-use crate::{ProposedCommand, ProposedFileOp, SourceFileContext, ToolProvider, ToolSpec};
+use crate::{
+    ProposedCommand, ProposedFileOp, SourceFileContext, ToolChoiceMode, ToolProvider, ToolSpec,
+};
 use shunt_core::safety;
 
 // ── System prompt ──────────────────────────────────────────────────────────────
-// Migrated from: clarify.system.txt + understand.system.txt; proposal/editing
-// now lives in this single agent prompt.
+// Externalized to prompts/agent.system.txt so it can be A/B'd and regression-tested
+// independently of the dispatch code (matching the other prompts/ files).
 
-pub(crate) const AGENT_SYSTEM_PROMPT_BASE: &str = "\
-You are a senior software engineer acting as a coding agent.
-Each response is ONE JSON action — the most useful next step.
+pub(crate) const AGENT_SYSTEM_PROMPT_BASE: &str = include_str!("../../../prompts/agent.system.txt");
 
-PRINCIPLES:
-- Design before code. Use think to understand the problem and form a plan before any edit.
-- Write as little code as possible. Every line is a liability — solve with the least that makes sense.
-- Smallest change that solves the real problem, not just the surface request.
-- Fail fast, never hide errors. Surface problems immediately; don't swallow or paper over them.
-- Patterns and structure over conditionals. Reach for data structures and composition, not branching.
-- Open for extension. Design so new behaviour can be added without modifying existing code.
-- Code for others. Names state intent. Units are small and single-responsibility.
-- Know the trade-off. When breaking a principle, be explicit in think about why.
+// ── Tool registry ────────────────────────────────────────────────────────────
+// Single source of truth for the action JSON-schema `tool` enum AND the system-prompt
+// tool reference (the `{{TOOLS}}` placeholder). Deriving both from one list means the
+// grammar the model is constrained to and the prose it is told about cannot drift.
 
-WORKFLOW:
-- Bias to action. The moment you have read the file containing the code to change, EDIT it with replace_lines (give the line numbers shown in the file). Do not keep searching or reading for related symbols, definitions, or callers you don't strictly need — the file in front of you is enough to make the change.
-- A successful replace_lines HAS changed the file. The result IS the file. Call done immediately after — never re-read, re-search, or repeat the same replace_lines to 'verify'. There is nothing to verify; the file view in the response is authoritative.
-- Spend think on HOW to make the edit, not on what else to look for. You have at most 1 think — don't burn turns exploring.
-- Create new files BEFORE updating registrations or imports that reference them.
-- After all edits look correct in the file view: call done immediately. Do NOT run commands just to confirm the edit landed — the file view IS the confirmation.
-- Only run a build command if (a) you can see a Cargo.toml or package.json in the workspace AND (b) the task involves code that could have type or syntax errors not visible from reading the file.
-  Node/TypeScript → command {\"command_action\":\"run\",\"command_line\":\"pnpm build\"}
-  Rust            → command {\"command_action\":\"run\",\"command_line\":\"cargo check\"}
-- Do NOT add new dependencies or edit manifests unless the task explicitly asks for a dependency/manifest change or the requested behavior cannot reasonably be implemented with existing code and standard libraries.
-- After changing dependency manifests or lockfiles, call command {\"command_action\":\"install_dependencies\"} so the runtime can run the correct install step after apply.
-- For long-running dev servers or daemons, use command actions start_service/status_service/stop_service. Do NOT wrap servers in timeout or background shell syntax.
-- If a build command fails once for any reason (tool not found, missing config, no manifest), call done immediately — do NOT retry the same command.
-- If build fails with a real compile error: think about root cause, replace_lines to fix, re-run build once.
-- If you see a conflict or a simpler approach, surface it with ask_user before proceeding.
-- write_file is for NEW files only — it errors if the file already exists.
-- replace_lines is the single tool for ALL edits to existing files:
-    • change lines: start_line and end_line within the file
-    • append: set start_line to (last line + 1) — e.g. a 4-line file → start_line=5
-    • delete lines: use replace_lines on the range; output nothing in the content step
-- Preserve all export keywords when refactoring TypeScript.
+struct ToolDef {
+    name: &'static str,
+    /// Offered in the agent (edit-capable) session.
+    agent: bool,
+    /// Offered in the read-only verifier session.
+    verifier: bool,
+    /// Only offered at depth 0 (top-level session) — e.g. ask_user.
+    depth0_only: bool,
+    /// Only offered when a knowledge-lookup backend is wired into the session.
+    needs_knowledge: bool,
+    /// System-prompt reference block (the `• name — …` text).
+    doc: &'static str,
+}
 
-Available tools:
+const TOOLS: &[ToolDef] = &[
+    ToolDef {
+        name: "read_file",
+        agent: true,
+        verifier: true,
+        depth0_only: false,
+        needs_knowledge: false,
+        doc: "• read_file — Load a file into context (returned with line numbers).\n  Required: path (string)",
+    },
+    ToolDef {
+        name: "search_files",
+        agent: true,
+        verifier: true,
+        depth0_only: false,
+        needs_knowledge: false,
+        doc: "• search_files — Search file contents and paths by keyword or symbol. Empty query = list all.\n  Required: query (string)",
+    },
+    ToolDef {
+        name: "knowledge",
+        agent: true,
+        verifier: false,
+        depth0_only: false,
+        needs_knowledge: true,
+        doc: "• knowledge — Look up external facts on demand: current package versions, library APIs, and recommended practices from registries and docs. Use when the task needs up-to-date ecosystem knowledge you don't have locally.\n  Required: query (string)",
+    },
+    ToolDef {
+        name: "edit",
+        agent: true,
+        verifier: false,
+        depth0_only: false,
+        needs_knowledge: false,
+        doc: "• edit — Create a new file or modify an existing one. Required: path.\n  • New file: OMIT start_line; content is the whole file. Errors if the file already exists.\n  • Modify: read the file first, then give start_line/end_line (1-indexed, inclusive) of the range to replace. One line: start_line = end_line. Append: start_line = last_line + 1. Delete: give the range and omit content.",
+    },
+    ToolDef {
+        name: "command",
+        agent: true,
+        verifier: true,
+        depth0_only: false,
+        needs_knowledge: false,
+        doc: "• command — Run a command and see its output. Runs synchronously; use it for installs, scaffolding, builds, tests, and any other finite command.\n  Required: command_line (string): the full command exactly as you would type it in a terminal, e.g. \"npm run build\" or \"npm create vite@latest frontend -- --template react-ts\". Quote arguments containing spaces.\n  It is NOT run through a shell. Use finite commands only — not dev servers, watchers, or other long-running processes (there is no way to keep a process running past the command).\n  Commands run with stdin closed. Use standalone, non-interactive invocations and pass whichever flag the tool uses to suppress prompts (e.g. --yes, -y, --no-input, --force, --non-interactive).\n  Never use shell operators (&&, ||, ;, |, >) — one command_line per call. Never run a bare interactive program (node, python, bash, npm) with no arguments.\n  To run in a subdirectory use cwd (relative path within workspace), not \"cd X && Y\". Example: {\"command_line\":\"npm install\",\"cwd\":\"frontend\"}\n  Examples: {\"command_line\":\"node -v\"}\n            {\"command_line\":\"npm run build\",\"cwd\":\"frontend\"}\n            {\"command_line\":\"npm create vite@latest . -- --template react-ts\"}",
+    },
+    ToolDef {
+        name: "ask_user",
+        agent: true,
+        verifier: false,
+        depth0_only: true,
+        needs_knowledge: false,
+        doc: "• ask_user — Ask the user when genuinely blocked or when surfacing a better approach.\n  Required: question (string), context (string)",
+    },
+    ToolDef {
+        name: "done",
+        agent: true,
+        verifier: true,
+        depth0_only: false,
+        needs_knowledge: false,
+        doc: "• done — Mark work complete.\n  Required: description (string — what changed and what was verified)\n  Optional: setup_commands (array of {command_line} objects, each command_line as typed in a terminal)\n  Verification sessions: criteria is required — one entry per acceptance criterion ID given in the task, each {id, status: passed|failed|skipped, evidence}. Do not omit an ID; do not report passed without evidence you actually gathered.",
+    },
+];
 
-• think — Record your reasoning before acting. No side effects.
-  Max 1 think call per session. After that, act directly.
-  Required: query (string — your plan, concern, or rationale)
+/// Agent tool enum for the given depth. Search and re-reads stay available after edits
+/// (recovery is bounded by the stall/loop detectors, not by removing tools). The
+/// knowledge tool is only offered when a lookup backend is wired in.
+fn agent_tool_names(depth: u8, has_knowledge: bool) -> Vec<&'static str> {
+    TOOLS
+        .iter()
+        .filter(|t| t.agent)
+        .filter(|t| !t.depth0_only || depth == 0)
+        .filter(|t| !t.needs_knowledge || has_knowledge)
+        .map(|t| t.name)
+        .collect()
+}
 
-• write_file — Create a brand-new file (content collected separately). Errors if the file already exists.
-  Required: path (string)
+fn verifier_tool_names() -> Vec<&'static str> {
+    TOOLS
+        .iter()
+        .filter(|t| t.verifier)
+        .map(|t| t.name)
+        .collect()
+}
 
-• replace_lines — The ONLY tool for editing an existing file. Handles replace, append, and delete.
-  Read the file first — loaded files show line numbers.
-  Required: path, start_line, end_line (1-indexed, inclusive).
-  You give ONLY the line range — replacement code is generated separately.
-  • Replace: start_line/end_line within file. To change one line: start_line = end_line.
-  • Append: set start_line = last_line + 1 (e.g. 4-line file → start_line=5, end_line=5).
-  • Delete: use the line range; output nothing in the content step.
+/// The `{{TOOLS}}` reference block injected into the system prompt.
+fn tools_doc(verifier: bool, has_knowledge: bool) -> String {
+    TOOLS
+        .iter()
+        .filter(|t| if verifier { t.verifier } else { t.agent })
+        .filter(|t| !t.needs_knowledge || has_knowledge)
+        .map(|t| t.doc)
+        .collect::<Vec<_>>()
+        .join("\n\n")
+}
 
-• delete_file — Remove a file.
-  Required: path (string)
+// ── Edit content strategy ──────────────────────────────────────────────────────
+// The edit tool is always single-shot: target selection and replacement content
+// travel together in one structured model output. Transport differences stay in
+// the provider layer, not in agent behavior.
 
-• read_file — Load a file into context.
-  Required: path (string)
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EditStrategy {
+    SingleShot,
+}
 
-• search_files — Search file contents and paths by keyword or symbol. Empty query = list all.
-  Required: query (string)
+impl EditStrategy {
+    fn for_capabilities(_tool_choice_mode: ToolChoiceMode) -> Self {
+        Self::SingleShot
+    }
 
-• command — Run commands, queue dependency installs, and manage services.
-  Required: command_action = run, install_dependencies, start_service, status_service, or stop_service.
-  run: command_line (string). Parsed into argv; not run through a shell.
-  install_dependencies: optional path (omit it or use '.' / a root manifest path).
-  start_service: service_name and command_line.
-  status_service/stop_service: service_name.
-  Examples: {\"tool\":\"command\",\"command_action\":\"run\",\"command_line\":\"cargo check\"}
-            {\"tool\":\"command\",\"command_action\":\"install_dependencies\"}
-            {\"tool\":\"command\",\"command_action\":\"start_service\",\"service_name\":\"api\",\"command_line\":\"python3 app.py\"}
-
-• ask_user — Ask the user when genuinely blocked or when surfacing a better approach.
-  Required: question (string), context (string)
-
-• sub_agent — Spawn a focused sub-session for a bounded task.
-  Required: task (string), context (string)
-
-• done — Mark work complete.
-  Required: description (string — what changed and what was verified)
-  Optional: setup_commands (array of {program, args} objects)";
+    fn content_in_schema(self) -> bool {
+        let _ = self;
+        true
+    }
+}
 
 // ── Tool dispatch schema ───────────────────────────────────────────────────────
 
-fn agent_schema(depth: u8, allow_think: bool, allow_search: bool) -> Value {
-    let mut tools: Vec<&str> = vec![
-        "write_file",
-        "replace_lines",
-        "delete_file",
-        "read_file",
-        "command",
-        "done",
-    ];
-    if allow_think {
-        tools.insert(0, "think");
-    }
-    if allow_search {
-        tools.push("search_files");
-    }
-    if depth == 0 {
-        tools.push("ask_user");
-        tools.push("sub_agent");
-    }
-    // Content fields (contents, old_str, new_str, patch, new_content) are intentionally
-    // excluded from the JSON schema. Local models refuse to generate large content in
-    // grammar-constrained JSON. Content is collected via a separate plain-text call.
-    // Note: maxLength / maxItems are omitted intentionally.
-    // llama.cpp grammar FSM is O(n) in maxLength — adding them to 8+ fields creates
-    // a grammar so large it takes minutes to compile before the first token is generated.
+fn agent_schema(depth: u8, single_shot: bool, has_knowledge: bool) -> Value {
+    let tools = agent_tool_names(depth, has_knowledge);
+    // Edit content is carried inline in `content`. maxLength / maxItems are omitted
+    // intentionally — llama.cpp's grammar FSM is O(n) in maxLength and would stall
+    // for minutes compiling the grammar before the first token.
     let mut schema = json!({
         "type": "object",
         "additionalProperties": false,
         "properties": {
             "tool":        { "type": "string", "enum": tools },
             "path":        { "type": "string" },
-            // replace_lines positioning — integers only (content is collected
-            // separately via generate_text; small models can't produce content
-            // inside grammar-constrained JSON).
             "start_line":  { "type": "integer" },
             "end_line":    { "type": "integer" },
             "query":       { "type": "string" },
-            "command_action": { "type": "string", "enum": ["run", "install_dependencies", "start_service", "status_service", "stop_service"] },
-            "cmd":         { "type": "string" },
             "command_line": { "type": "string" },
-            "service_name": { "type": "string" },
-            "args":        { "type": "array", "items": { "type": "string" } },
+            "cwd":         { "type": "string" },
             "question":    { "type": "string" },
             "context":     { "type": "string" },
             "task":        { "type": "string" },
@@ -170,31 +194,26 @@ fn agent_schema(depth: u8, allow_think: bool, allow_search: bool) -> Value {
                 "items": {
                     "type": "object",
                     "properties": {
-                        "program": { "type": "string" },
-                        "args":    { "type": "array", "items": { "type": "string" } }
+                        "command_line": { "type": "string" },
+                        "cwd":          { "type": "string" }
                     },
-                    "required": ["program", "args"]
+                    "required": ["command_line"]
                 }
             }
         },
         "required": ["tool"]
     });
-    if !allow_think
-        && !allow_search
-        && let Some(properties) = schema.get_mut("properties").and_then(Value::as_object_mut)
-    {
-        properties.remove("query");
+    let _ = single_shot;
+    if let Some(properties) = schema.get_mut("properties").and_then(Value::as_object_mut) {
+        properties.insert("content".into(), json!({ "type": "string" }));
     }
     schema
 }
 
-// Verifier is read-only: write/str_replace/delete are excluded from the grammar
-// so the model physically cannot generate them even if it ignores the prompt.
-fn verifier_schema(allow_think: bool) -> Value {
-    let mut tools = vec!["read_file", "search_files", "command", "done"];
-    if allow_think {
-        tools.insert(0, "think");
-    }
+// Verifier is read-only: write/edit/delete are excluded from the grammar so the model
+// physically cannot generate them even if it ignores the prompt.
+fn verifier_schema() -> Value {
+    let tools = verifier_tool_names();
     json!({
         "type": "object",
         "additionalProperties": false,
@@ -202,12 +221,22 @@ fn verifier_schema(allow_think: bool) -> Value {
             "tool":        { "type": "string", "enum": tools },
             "path":        { "type": "string" },
             "query":       { "type": "string" },
-            "command_action": { "type": "string", "enum": ["run", "start_service", "status_service", "stop_service"] },
-            "cmd":         { "type": "string" },
             "command_line": { "type": "string" },
-            "service_name": { "type": "string" },
-            "args":        { "type": "array", "items": { "type": "string" } },
-            "description": { "type": "string" }
+            "cwd":         { "type": "string" },
+            "description": { "type": "string" },
+            "criteria": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "properties": {
+                        "id":       { "type": "string" },
+                        "status":   { "type": "string", "enum": ["passed", "failed", "skipped"] },
+                        "evidence": { "type": "string" }
+                    },
+                    "required": ["id", "status", "evidence"]
+                }
+            }
         },
         "required": ["tool"]
     })
@@ -221,22 +250,63 @@ struct AgentAction {
     path: Option<String>,
     start_line: Option<usize>,
     end_line: Option<usize>,
-    patch: Option<String>,
-    old_str: Option<String>,
-    new_str: Option<String>,
+    /// Single-shot replacement/new-file content (native function-calling models).
+    content: Option<String>,
     query: Option<String>,
-    command_action: Option<String>,
-    cmd: Option<String>,
     command_line: Option<String>,
-    service_name: Option<String>,
-    #[serde(default)]
-    args: Vec<String>,
+    cwd: Option<String>,
     question: Option<String>,
     context: Option<String>,
     task: Option<String>,
     description: Option<String>,
     #[serde(default)]
-    setup_commands: Vec<ProposedCommand>,
+    setup_commands: Vec<SetupCommandSpec>,
+    #[serde(default)]
+    criteria: Vec<RawCriterion>,
+}
+
+/// Wire shape for one `setup_commands` entry: a command line as typed in a
+/// terminal, plus an optional working directory. Parsed into a `ProposedCommand`
+/// via `split_command_line`.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+struct SetupCommandSpec {
+    command_line: String,
+    #[serde(default)]
+    cwd: Option<String>,
+}
+
+/// Wire shape for one `criteria` entry on the `done` tool — status arrives as the
+/// lowercase string the grammar constrains it to, not the `VerifierStatus` variant name.
+#[derive(Debug, Deserialize)]
+struct RawCriterion {
+    id: String,
+    status: String,
+    evidence: String,
+}
+
+impl RawCriterion {
+    /// Parse into the domain type. An unrecognised status fails closed — a verifier that
+    /// emits garbage here should not be read as having passed.
+    fn into_outcome(self) -> CriterionOutcome {
+        let status = match self.status.as_str() {
+            "passed" => shunt_core::VerifierStatus::Passed,
+            "skipped" => shunt_core::VerifierStatus::Skipped,
+            _ => shunt_core::VerifierStatus::Failed,
+        };
+        CriterionOutcome {
+            id: self.id,
+            status,
+            evidence: self.evidence,
+        }
+    }
+}
+
+/// One criterion verdict reported by a verifier session's `done` call.
+#[derive(Debug, Clone)]
+pub struct CriterionOutcome {
+    pub id: String,
+    pub status: shunt_core::VerifierStatus,
+    pub evidence: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -253,26 +323,23 @@ impl AgentActionEnvelope {
             Self::Direct(action) | Self::Action { action } => action,
             Self::Actions { mut actions } => {
                 actions.drain(..).next().unwrap_or_else(|| AgentAction {
-                    tool: "think".into(),
+                    // Empty actions array — emit a no-op read with no path so dispatch
+                    // returns an informative "provide a path" error that nudges the model
+                    // to choose a single concrete action next turn.
+                    tool: "read_file".into(),
                     path: None,
                     start_line: None,
                     end_line: None,
-                    patch: None,
-                    old_str: None,
-                    new_str: None,
+                    content: None,
                     query: None,
-                    command_action: None,
-                    cmd: None,
                     command_line: None,
-                    service_name: None,
-                    args: vec![],
+                    cwd: None,
                     question: None,
-                    context: Some(
-                        "model returned an empty actions array; choose one action".into(),
-                    ),
+                    context: None,
                     task: None,
                     description: None,
                     setup_commands: vec![],
+                    criteria: vec![],
                 })
             }
         }
@@ -290,6 +357,14 @@ pub struct AgentTurn {
     pub ok: bool,
 }
 
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct AgentPauseState {
+    pub task: String,
+    pub turns: Vec<AgentTurn>,
+    pub file_state: HashMap<String, String>,
+    pub partial_ops: Vec<ProposedFileOp>,
+}
+
 /// Content archived from hot context to cold storage when the token budget is
 /// exceeded.  Compressed summary stays in hot context; full original is here
 /// for potential recall.
@@ -302,6 +377,16 @@ struct ColdEntry {
     compressed_to: String,
 }
 
+#[derive(Debug, Clone)]
+struct CommandObservation {
+    summary: String,
+}
+
+#[derive(Debug, Clone)]
+struct CommandExpectationState {
+    workspace_fingerprint: Option<u64>,
+}
+
 /// The outcome of running an agent session.
 #[derive(Debug)]
 pub enum AgentResult {
@@ -312,6 +397,10 @@ pub enum AgentResult {
         description: String,
         /// Final file state — used to warm a follow-up fix session without re-reading from disk.
         file_state: HashMap<String, String>,
+        /// Per-criterion verdicts reported via `done`. Empty for non-verifier sessions and for
+        /// verifier sessions that never call `done` with `criteria` (treated as inconclusive by
+        /// the caller, not as a pass).
+        criteria: Vec<CriterionOutcome>,
     },
     /// The agent needs the user to answer a question before it can continue.
     /// Save `turns`, `file_state`, and `partial_ops`, surface `question`, then call
@@ -324,8 +413,6 @@ pub enum AgentResult {
         /// Ops already applied before the question — carry them so callers can
         /// surface partial work even if the session doesn't resume.
         partial_ops: Vec<ProposedFileOp>,
-        /// Deferred setup commands queued before the question.
-        queued_setup_commands: Vec<ProposedCommand>,
     },
     /// Hit the turn limit without calling `done`.
     MaxTurnsReached,
@@ -339,6 +426,17 @@ pub trait AgentObserver: Send + Sync {
     fn on_note(&self, _text: &str) {}
 }
 
+/// On-demand external knowledge lookup (package versions, library APIs, best
+/// practices). The agent loop calls this when the model uses the `knowledge` tool.
+///
+/// Defined here so `shunt-infer` stays independent of `shunt-knowledge`; the runtime
+/// injects an implementation backed by `KnowledgeService` via
+/// [`AgentSession::with_knowledge`].
+pub trait KnowledgeLookup: Send + Sync {
+    /// Resolve `query` to a human-readable evidence summary, or an error message.
+    fn lookup(&self, query: &str) -> Result<String, String>;
+}
+
 // ── Dispatch result (internal) ────────────────────────────────────────────────
 
 enum Dispatch {
@@ -349,6 +447,7 @@ enum Dispatch {
     Done {
         description: String,
         setup_commands: Vec<ProposedCommand>,
+        criteria: Vec<CriterionOutcome>,
     },
     NeedsClarification {
         question: String,
@@ -365,13 +464,14 @@ enum Dispatch {
 /// callers can construct custom budgets for testing or special sessions.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct SessionBudget {
-    /// Hard turn ceiling — session aborts (returns MaxTurnsReached) after this many
-    /// turns regardless of progress.
+    /// Maximum turns the session may spend without adding new evidence or changing
+    /// workspace state. Progress extends the budget window.
     pub max_turns: usize,
     /// Consecutive idle turns (think / read_file / search_files, no edits or commands)
     /// at which a STALL WARNING is injected into the next user prompt.
     pub stall_warn_at: usize,
-    /// Consecutive idle turns at which the session is aborted.  Must be > stall_warn_at.
+    /// Legacy idle-abort threshold retained for configuration compatibility. Idle turns
+    /// no longer abort directly; the progress budget is the actual stop condition.
     pub stall_abort_at: usize,
 }
 
@@ -463,13 +563,6 @@ impl SessionBudgetOverride {
 
 const MAX_CMD_OUTPUT: usize = 2048;
 const REPAIR_TURN_EXTENSION: usize = 4;
-
-struct BackgroundService {
-    command_line: String,
-    child: std::process::Child,
-    stdout: Arc<Mutex<Vec<u8>>>,
-    stderr: Arc<Mutex<Vec<u8>>>,
-}
 
 /// Gitignore-style patterns always blocked from `read_file` and file listing.
 /// Users can extend (not replace) this list via `AgentSession::with_ignore_patterns`.
@@ -579,10 +672,9 @@ pub struct AgentSession<'a, P> {
     is_verifier: bool,
     budget: SessionBudget,
     wall_timeout: Option<Duration>,
-    observer: Option<Arc<dyn AgentObserver>>,
+    observer: Option<Arc<dyn AgentObserver + Send + Sync>>,
     /// Original task — stored so dispatch can use it in two-phase generation.
     current_task: String,
-    queued_setup_commands: Vec<ProposedCommand>,
     /// Paths successfully written in this session — guards against infinite write loops.
     written_paths: HashSet<String>,
     /// (path, start_line) of ranges already replaced this session — guards against
@@ -594,9 +686,12 @@ pub struct AgentSession<'a, P> {
     /// means the model is stuck on the wrong file/range, so block before another
     /// replacement-generation call burns time.
     ineffective_edit_ranges: HashSet<(String, usize, usize)>,
-    /// Successful command keys since the last file/setup change. Prevents burning
-    /// turns on identical verification commands when there is nothing new to check.
-    successful_commands_since_change: HashSet<String>,
+    /// Latest command result rendered as a short observation so the next turn can treat
+    /// it as fresh evidence instead of blindly repeating the command.
+    latest_command: Option<CommandObservation>,
+    /// Absolute completed-turn index of the latest turn that changed workspace state or
+    /// added genuinely new evidence. The session budget is applied relative to this.
+    last_progress_turn: usize,
     /// Extra gitignore-style patterns added on top of DEFAULT_IGNORE_PATTERNS.
     /// Use `with_ignore_patterns` to extend; these are never used to override defaults.
     extra_ignore_patterns: Vec<String>,
@@ -607,14 +702,19 @@ pub struct AgentSession<'a, P> {
     /// Content evicted from `conv_history` when the token budget was exceeded.
     /// Compressed summaries stay in hot context; originals archived here for recall.
     cold_entries: Vec<ColdEntry>,
-    /// Session-local long-running processes started via start_service.
-    services: HashMap<String, BackgroundService>,
+    /// How edit content is produced — capability-gated (single-shot vs two-phase).
+    edit_strategy: EditStrategy,
+    /// On-demand external knowledge backend; when present the `knowledge` tool is offered.
+    knowledge: Option<Arc<dyn KnowledgeLookup>>,
 }
 
 impl<'a, P: ToolProvider> AgentSession<'a, P> {
     /// Create a top-level session.  The system prompt is built from the workspace.
     pub fn new(provider: &'a P, workspace_root: &str) -> Self {
-        let system_prompt = build_system_prompt(workspace_root);
+        let edit_strategy =
+            EditStrategy::for_capabilities(provider.capabilities().tool_choice_mode);
+        let system_prompt =
+            build_system_prompt(workspace_root, edit_strategy.content_in_schema(), false);
         Self {
             provider,
             workspace_root: workspace_root.to_string(),
@@ -628,21 +728,24 @@ impl<'a, P: ToolProvider> AgentSession<'a, P> {
             wall_timeout: None,
             observer: None,
             current_task: String::new(),
-            queued_setup_commands: Vec::new(),
             written_paths: HashSet::new(),
             edited_lines: HashSet::new(),
             ineffective_edit_ranges: HashSet::new(),
-            successful_commands_since_change: HashSet::new(),
+            latest_command: None,
+            last_progress_turn: 0,
             extra_ignore_patterns: Vec::new(),
             conv_history: Vec::new(),
             cold_entries: Vec::new(),
-            services: HashMap::new(),
+            edit_strategy,
+            knowledge: None,
         }
     }
 
     /// Create a verifier session — QA mindset, read-only, reports PASS/FAIL.
-    pub fn new_verifier(provider: &'a P, workspace_root: &str) -> Self {
-        let system_prompt = build_verifier_prompt(workspace_root);
+    /// `changed_paths` are the workspace-relative files the builder touched; used to
+    /// locate the relevant manifest/project directory instead of assuming the root.
+    pub fn new_verifier(provider: &'a P, workspace_root: &str, changed_paths: &[String]) -> Self {
+        let system_prompt = build_verifier_prompt(workspace_root, changed_paths);
         Self {
             provider,
             workspace_root: workspace_root.to_string(),
@@ -656,42 +759,17 @@ impl<'a, P: ToolProvider> AgentSession<'a, P> {
             wall_timeout: None,
             observer: None,
             current_task: String::new(),
-            queued_setup_commands: Vec::new(),
             written_paths: HashSet::new(),
             edited_lines: HashSet::new(),
             ineffective_edit_ranges: HashSet::new(),
-            successful_commands_since_change: HashSet::new(),
+            latest_command: None,
+            last_progress_turn: 0,
             extra_ignore_patterns: Vec::new(),
             conv_history: Vec::new(),
             cold_entries: Vec::new(),
-            services: HashMap::new(),
-        }
-    }
-
-    fn new_sub(provider: &'a P, workspace_root: &str) -> Self {
-        let system_prompt = build_system_prompt(workspace_root);
-        Self {
-            provider,
-            workspace_root: workspace_root.to_string(),
-            system_prompt,
-            turns: Vec::new(),
-            file_state: HashMap::new(),
-            ops: Vec::new(),
-            depth: 1,
-            is_verifier: false,
-            budget: SessionBudget::for_sub_agent(),
-            wall_timeout: None,
-            observer: None,
-            current_task: String::new(),
-            queued_setup_commands: Vec::new(),
-            written_paths: HashSet::new(),
-            edited_lines: HashSet::new(),
-            ineffective_edit_ranges: HashSet::new(),
-            successful_commands_since_change: HashSet::new(),
-            extra_ignore_patterns: Vec::new(),
-            conv_history: Vec::new(),
-            cold_entries: Vec::new(),
-            services: HashMap::new(),
+            // Verifier never edits — keep the same single-shot schema shape.
+            edit_strategy: EditStrategy::SingleShot,
+            knowledge: None,
         }
     }
 
@@ -726,8 +804,22 @@ impl<'a, P: ToolProvider> AgentSession<'a, P> {
         self
     }
 
-    pub fn with_observer(mut self, obs: Arc<dyn AgentObserver>) -> Self {
+    pub fn with_observer(mut self, obs: Arc<dyn AgentObserver + Send + Sync>) -> Self {
         self.observer = Some(obs);
+        self
+    }
+
+    /// Wire in an external knowledge backend, enabling the `knowledge` tool.
+    /// Rebuilds the system prompt so the tool reference matches the schema.
+    pub fn with_knowledge(mut self, knowledge: Arc<dyn KnowledgeLookup>) -> Self {
+        self.knowledge = Some(knowledge);
+        if !self.is_verifier {
+            self.system_prompt = build_system_prompt(
+                &self.workspace_root,
+                self.edit_strategy.content_in_schema(),
+                self.knowledge.is_some(),
+            );
+        }
         self
     }
 
@@ -738,7 +830,6 @@ impl<'a, P: ToolProvider> AgentSession<'a, P> {
         workspace_root: &str,
         mut saved_turns: Vec<AgentTurn>,
         saved_file_state: HashMap<String, String>,
-        saved_setup_commands: Vec<ProposedCommand>,
         user_answer: &str,
     ) -> AgentResult {
         // Patch the last turn (the ask_user that triggered the pause) with the answer.
@@ -763,8 +854,48 @@ impl<'a, P: ToolProvider> AgentSession<'a, P> {
         session.conv_history = conv_history;
         session.turns = saved_turns;
         session.file_state = saved_file_state;
-        session.queued_setup_commands = saved_setup_commands;
+        session.last_progress_turn = session.turns.len();
+        session.latest_command = latest_command_observation(&session.turns);
         session.run_inner("(continuing after user answered)")
+    }
+
+    pub fn resume_paused(
+        provider: &'a P,
+        workspace_root: &str,
+        mut pause: AgentPauseState,
+        user_answer: &str,
+        budget: SessionBudget,
+        observer: Option<Arc<dyn AgentObserver + Send + Sync>>,
+        ignore_patterns: Vec<String>,
+    ) -> AgentResult {
+        if let Some(last) = pause.turns.last_mut()
+            && last.tool == "ask_user"
+        {
+            last.result = format!("User answered: {user_answer}");
+        }
+        let conv_history: Vec<(String, String)> = pause
+            .turns
+            .iter()
+            .flat_map(|t| {
+                let assistant_stub = serde_json::json!({ "tool": t.tool }).to_string();
+                [
+                    ("assistant".to_string(), assistant_stub),
+                    ("user".to_string(), t.result.clone()),
+                ]
+            })
+            .collect();
+        let mut session = Self::new(provider, workspace_root).with_budget(budget);
+        if let Some(observer) = observer {
+            session = session.with_observer(observer);
+        }
+        session.extra_ignore_patterns = ignore_patterns;
+        session.conv_history = conv_history;
+        session.turns = pause.turns;
+        session.file_state = pause.file_state;
+        session.ops = pause.partial_ops;
+        session.last_progress_turn = session.turns.len();
+        session.latest_command = latest_command_observation(&session.turns);
+        session.run_inner(&pause.task)
     }
 
     /// Start (or continue) the agent on `task`.
@@ -785,8 +916,8 @@ impl<'a, P: ToolProvider> AgentSession<'a, P> {
             content: format!("TASK: {task}"),
         };
 
-        let mut turn_idx = 0usize;
-        while turn_idx < self.effective_max_turns() {
+        while self.turns.len() < self.effective_max_turns() {
+            let turn_idx = self.turns.len();
             if self.exceeded_wall_timeout(started_at) {
                 if let Some(done) = self.try_autocomplete("wall-clock timeout") {
                     return done;
@@ -794,13 +925,16 @@ impl<'a, P: ToolProvider> AgentSession<'a, P> {
                 if let Some(o) = &self.observer {
                     o.on_note("ERROR: agent session wall-clock timeout exceeded");
                 }
-                self.stop_all_services();
                 return AgentResult::MaxTurnsReached;
             }
             let schema = if self.is_verifier {
-                verifier_schema(self.allow_think())
+                verifier_schema()
             } else {
-                agent_schema(self.depth, self.allow_think(), self.allow_search())
+                agent_schema(
+                    self.depth,
+                    self.edit_strategy.content_in_schema(),
+                    self.knowledge.is_some(),
+                )
             };
             let action_tool = ToolSpec {
                 name: "agent_action".into(),
@@ -818,6 +952,8 @@ impl<'a, P: ToolProvider> AgentSession<'a, P> {
                 &self.file_state,
                 &self.ops,
                 &self.turns,
+                self.latest_command.as_ref(),
+                self.effective_max_turns().saturating_sub(self.turns.len()),
                 &self.workspace_root,
                 &self.budget,
             );
@@ -913,7 +1049,6 @@ impl<'a, P: ToolProvider> AgentSession<'a, P> {
                                 result: detail,
                                 ok: false,
                             });
-                            turn_idx += 1;
                             continue;
                         }
                         let err_msg =
@@ -922,7 +1057,6 @@ impl<'a, P: ToolProvider> AgentSession<'a, P> {
                         if let Some(o) = &self.observer {
                             o.on_note(&format!("ERROR: {err_msg}"));
                         }
-                        self.stop_all_services();
                         return AgentResult::MaxTurnsReached;
                     }
                 }
@@ -944,15 +1078,10 @@ impl<'a, P: ToolProvider> AgentSession<'a, P> {
                 Dispatch::Done {
                     description,
                     setup_commands,
+                    criteria,
                 } => {
                     if let Some(o) = &obs {
                         o.on_tool_result(turn_idx, true, &description);
-                    }
-                    let mut all_setup_commands = self.queued_setup_commands.clone();
-                    for cmd in setup_commands {
-                        if !all_setup_commands.iter().any(|existing| existing == &cmd) {
-                            all_setup_commands.push(cmd);
-                        }
                     }
                     // Record final turn in history.
                     self.conv_history.push(("assistant".into(), action_json));
@@ -962,12 +1091,12 @@ impl<'a, P: ToolProvider> AgentSession<'a, P> {
                         result: description.clone(),
                         ok: true,
                     });
-                    self.stop_all_services();
                     return AgentResult::Done {
                         ops: std::mem::take(&mut self.ops),
-                        setup_commands: all_setup_commands,
+                        setup_commands,
                         description,
                         file_state: self.file_state.clone(),
+                        criteria,
                     };
                 }
 
@@ -982,7 +1111,6 @@ impl<'a, P: ToolProvider> AgentSession<'a, P> {
                             result: note,
                             ok: true,
                         });
-                        turn_idx += 1;
                         continue;
                     }
                     if let Some(o) = &obs {
@@ -996,14 +1124,12 @@ impl<'a, P: ToolProvider> AgentSession<'a, P> {
                         result: waiting_msg,
                         ok: true,
                     });
-                    self.stop_all_services();
                     return AgentResult::NeedsClarification {
                         question,
                         context,
                         turns: self.turns.clone(),
                         file_state: self.file_state.clone(),
                         partial_ops: self.ops.clone(),
-                        queued_setup_commands: self.queued_setup_commands.clone(),
                     };
                 }
 
@@ -1014,44 +1140,13 @@ impl<'a, P: ToolProvider> AgentSession<'a, P> {
                     // Append turn to conversation history (compact: result only, no FILES).
                     self.conv_history.push(("assistant".into(), action_json));
                     self.conv_history.push(("user".into(), result.clone()));
+                    let made_progress = self.turn_made_progress(&tool, &result, ok);
                     self.turns.push(AgentTurn { tool, result, ok });
-
-                    // Stall detection — idle streak (read/think/search without editing).
-                    let idle_streak = self
-                        .turns
-                        .iter()
-                        .rev()
-                        .take_while(|t| {
-                            matches!(t.tool.as_str(), "think" | "read_file" | "search_files")
-                        })
-                        .count();
-                    if idle_streak > self.budget.stall_abort_at {
-                        tracing::warn!(
-                            "AgentSession stall: {idle_streak} consecutive idle turns — aborting"
-                        );
-                        self.stop_all_services();
-                        return AgentResult::MaxTurnsReached;
-                    }
-
-                    // Failed-action loop detection: if the last 3 turns all failed
-                    // on the same tool with ok:false the model is stuck in a loop
-                    // (e.g. repeatedly emitting replace_lines with no path field).
-                    // Abort immediately — retrying won't help.
-                    let failed_streak: Vec<_> = self.turns.iter().rev().take(3).collect();
-                    if failed_streak.len() == 3
-                        && failed_streak.iter().all(|t| !t.ok)
-                        && failed_streak.windows(2).all(|w| w[0].tool == w[1].tool)
-                    {
-                        let stuck_tool = &failed_streak[0].tool;
-                        tracing::warn!(
-                            "AgentSession: 3 consecutive failed '{stuck_tool}' calls — aborting error loop"
-                        );
-                        self.stop_all_services();
-                        return AgentResult::MaxTurnsReached;
+                    if made_progress {
+                        self.last_progress_turn = self.turns.len();
                     }
                 }
             }
-            turn_idx += 1;
         }
 
         if let Some(done) = self.try_autocomplete("turn limit") {
@@ -1059,18 +1154,12 @@ impl<'a, P: ToolProvider> AgentSession<'a, P> {
         }
 
         // Turn limit reached without enough evidence to auto-complete.
-        self.stop_all_services();
         AgentResult::MaxTurnsReached
     }
 
     fn try_autocomplete(&mut self, reason: &str) -> Option<AgentResult> {
         let last_turn = self.turns.last()?;
-        if !(last_turn.ok
-            && matches!(
-                last_turn.tool.as_str(),
-                "write_file" | "replace_lines" | "delete_file"
-            ))
-        {
+        if !(last_turn.ok && matches!(last_turn.tool.as_str(), "edit" | "delete_file")) {
             return None;
         }
         if self.ops.is_empty()
@@ -1085,14 +1174,14 @@ impl<'a, P: ToolProvider> AgentSession<'a, P> {
                 "Auto-completing after {reason}; runtime verification will validate the edits."
             ));
         }
-        self.stop_all_services();
         Some(AgentResult::Done {
             ops: std::mem::take(&mut self.ops),
-            setup_commands: std::mem::take(&mut self.queued_setup_commands),
+            setup_commands: Vec::new(),
             description: format!(
                 "Applied edits before {reason}; runtime verification should validate the result."
             ),
             file_state: self.file_state.clone(),
+            criteria: Vec::new(),
         })
     }
 
@@ -1103,290 +1192,120 @@ impl<'a, P: ToolProvider> AgentSession<'a, P> {
     }
 
     fn effective_max_turns(&self) -> usize {
+        let progress_budget = self.last_progress_turn + self.budget.max_turns;
         if self.is_repair_extension_eligible() {
-            self.budget.max_turns + REPAIR_TURN_EXTENSION
+            progress_budget + REPAIR_TURN_EXTENSION
         } else {
-            self.budget.max_turns
+            progress_budget
         }
+    }
+
+    fn turn_made_progress(&self, tool: &str, result: &str, ok: bool) -> bool {
+        if ok && matches!(tool, "edit" | "delete_file" | "ask_user") {
+            return true;
+        }
+        self.result_adds_new_information(tool, result)
+    }
+
+    fn result_adds_new_information(&self, tool: &str, result: &str) -> bool {
+        let evidence = turn_evidence_key(tool, result);
+        !evidence.is_empty()
+            && !self
+                .turns
+                .iter()
+                .any(|turn| turn.tool == tool && turn_evidence_key(tool, &turn.result) == evidence)
     }
 
     fn is_repair_extension_eligible(&self) -> bool {
-        let wrote_any = self.turns.iter().any(|turn| {
-            turn.ok
-                && matches!(
-                    turn.tool.as_str(),
-                    "write_file" | "replace_lines" | "delete_file"
-                )
-        });
-        let ran_any_command = self.turns.iter().any(|turn| {
-            matches!(
-                turn.tool.as_str(),
-                "command" | "run_command" | "run_command_line" | "install_dependencies"
-            )
-        });
+        let wrote_any = self
+            .turns
+            .iter()
+            .any(|turn| turn.ok && matches!(turn.tool.as_str(), "edit" | "delete_file"));
+        let ran_any_command = self
+            .turns
+            .iter()
+            .any(|turn| matches!(turn.tool.as_str(), "command"));
         wrote_any && ran_any_command
     }
 
-    fn allow_think(&self) -> bool {
-        !self
-            .turns
-            .iter()
-            .any(|turn| turn.tool == "think" && turn.ok)
-            && !self.turns.iter().any(|turn| {
-                turn.ok
-                    && matches!(
-                        turn.tool.as_str(),
-                        "write_file" | "replace_lines" | "delete_file"
-                    )
-            })
-    }
-
-    fn allow_search(&self) -> bool {
-        !self.turns.iter().any(|turn| {
-            turn.ok
-                && matches!(
-                    turn.tool.as_str(),
-                    "write_file" | "replace_lines" | "delete_file"
-                )
-        })
-    }
-
-    fn stop_all_services(&mut self) {
-        let names: Vec<String> = self.services.keys().cloned().collect();
-        for name in names {
-            let _ = self.stop_service(&name);
-        }
-    }
-
-    fn start_service(&mut self, name: &str, command_line: &str) -> Dispatch {
-        let name = name.trim();
-        if name.is_empty() {
-            return Dispatch::Continue {
-                result: "Error: service_name is required. Example: {\"tool\":\"start_service\",\"service_name\":\"api\",\"command_line\":\"python3 app.py\"}".into(),
-                ok: false,
-            };
-        }
-        if !name
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_'))
-        {
-            return Dispatch::Continue {
-                result: "Error: service_name may only contain letters, numbers, '-' and '_'."
-                    .into(),
-                ok: false,
-            };
-        }
-        if self.services.contains_key(name) {
-            return Dispatch::Continue {
-                result: format!(
-                    "Error: service '{name}' already exists. Use status_service or stop_service first."
-                ),
-                ok: false,
-            };
-        }
-
-        let command_line = command_line.trim();
-        if command_line.is_empty() {
-            return Dispatch::Continue {
-                result: "Error: command_line is required for start_service.".into(),
-                ok: false,
-            };
-        }
-        let argv = match split_command_line(command_line) {
-            Ok(argv) => argv,
-            Err(e) => {
-                return Dispatch::Continue {
-                    result: format!("Error parsing command_line: {e}"),
-                    ok: false,
-                };
-            }
+    fn execute_deduped_command(
+        &mut self,
+        key: String,
+        program: &str,
+        args: &[String],
+        cwd: Option<String>,
+    ) -> Dispatch {
+        let command = ProposedCommand {
+            program: program.to_string(),
+            args: args.to_vec(),
+            cwd,
+            ..Default::default()
         };
-        if argv.is_empty() {
-            return Dispatch::Continue {
-                result: "Error: command_line did not contain a program".into(),
-                ok: false,
-            };
-        }
-        if let Err(result) = check_command_safety(&argv[0], &argv[1..]) {
-            return result;
-        }
-
-        let mut child = match std::process::Command::new(&argv[0])
-            .args(&argv[1..])
-            .current_dir(&self.workspace_root)
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped())
-            .spawn()
-        {
-            Ok(child) => child,
-            Err(e) => {
-                return Dispatch::Continue {
-                    result: format!("Error spawning service '{name}': {e}"),
-                    ok: false,
-                };
-            }
-        };
-
-        let stdout = Arc::new(Mutex::new(Vec::new()));
-        let stderr = Arc::new(Mutex::new(Vec::new()));
-        if let Some(pipe) = child.stdout.take() {
-            spawn_log_reader(pipe, stdout.clone());
-        }
-        if let Some(pipe) = child.stderr.take() {
-            spawn_log_reader(pipe, stderr.clone());
-        }
-
-        std::thread::sleep(std::time::Duration::from_millis(150));
-        match child.try_wait() {
-            Ok(Some(status)) => Dispatch::Continue {
-                result: format!(
-                    "Service '{name}' exited immediately with {status}.\n{}",
-                    service_logs(&stdout, &stderr)
-                )
-                .trim()
-                .to_string(),
-                ok: false,
-            },
-            Ok(None) => {
-                self.services.insert(
-                    name.to_string(),
-                    BackgroundService {
-                        command_line: command_line.to_string(),
-                        child,
-                        stdout,
-                        stderr,
-                    },
-                );
-                Dispatch::Continue {
-                    result: format!("Service '{name}' started: {command_line}"),
-                    ok: true,
-                }
-            }
-            Err(e) => Dispatch::Continue {
-                result: format!("Error checking service '{name}': {e}"),
-                ok: false,
-            },
-        }
-    }
-
-    fn status_service(&mut self, name: &str) -> Dispatch {
-        let name = name.trim();
-        let Some(service) = self.services.get_mut(name) else {
-            return Dispatch::Continue {
-                result: format!(
-                    "Error: service '{name}' is not running. Active services: {}",
-                    self.active_service_names()
-                ),
-                ok: false,
-            };
-        };
-        let state = match service.child.try_wait() {
-            Ok(Some(status)) => format!("exited with {status}"),
-            Ok(None) => "running".into(),
-            Err(e) => format!("status error: {e}"),
-        };
-        Dispatch::Continue {
-            result: format!(
-                "Service '{name}' ({}) is {state}.\n{}",
-                service.command_line,
-                service_logs(&service.stdout, &service.stderr)
-            )
-            .trim()
-            .to_string(),
-            ok: true,
-        }
-    }
-
-    fn stop_service(&mut self, name: &str) -> Dispatch {
-        let name = name.trim();
-        let Some(mut service) = self.services.remove(name) else {
-            return Dispatch::Continue {
-                result: format!(
-                    "Error: service '{name}' is not running. Active services: {}",
-                    self.active_service_names()
-                ),
-                ok: false,
-            };
-        };
-        let state = match service.child.try_wait() {
-            Ok(Some(status)) => format!("already exited with {status}"),
-            Ok(None) => {
-                let _ = service.child.kill();
-                match service.child.wait() {
-                    Ok(status) => format!("stopped with {status}"),
-                    Err(e) => format!("stop wait error: {e}"),
-                }
-            }
-            Err(e) => format!("status error before stop: {e}"),
-        };
-        std::thread::sleep(std::time::Duration::from_millis(50));
-        Dispatch::Continue {
-            result: format!(
-                "Service '{name}' ({}) {state}.\n{}",
-                service.command_line,
-                service_logs(&service.stdout, &service.stderr)
-            )
-            .trim()
-            .to_string(),
-            ok: true,
-        }
-    }
-
-    fn active_service_names(&self) -> String {
-        if self.services.is_empty() {
-            "none".into()
-        } else {
-            let mut names: Vec<&str> = self.services.keys().map(String::as_str).collect();
-            names.sort();
-            names.join(", ")
-        }
-    }
-
-    fn execute_deduped_command(&mut self, key: String, program: &str, args: &[String]) -> Dispatch {
-        if self.successful_commands_since_change.contains(&key) {
-            return Dispatch::Continue {
-                result: format!(
-                    "Error: command already succeeded with no intervening file or setup change: {}. \
-                     Do not repeat successful verification commands. Call done if the task is satisfied, \
-                     or edit/install something before running it again.",
-                    render_command(program, args)
-                ),
-                ok: false,
-            };
-        }
-
         if let Err(e) = self.materialize_session_files() {
             return Dispatch::Continue {
-                result: format!("Error preparing workspace for command: {e}"),
+                result: command_failure_result(
+                    "workspace_materialization_error",
+                    &render_command(program, args),
+                    &format!("Error preparing workspace for command: {e}"),
+                    Vec::new(),
+                ),
                 ok: false,
             };
         }
 
-        while let Some(command) = self.queued_setup_commands.first().cloned() {
-            let setup_result =
-                execute_command(&self.workspace_root, &command.program, &command.args);
-            match setup_result {
-                Dispatch::Continue { ok: true, .. } => {
-                    self.queued_setup_commands.remove(0);
-                }
-                Dispatch::Continue { result, .. } => {
-                    return Dispatch::Continue {
-                        result: format!(
-                            "Setup command failed before verification: {}\n{result}",
-                            render_command(&command.program, &command.args)
-                        ),
-                        ok: false,
-                    };
-                }
-                other => return other,
-            }
-        }
-
-        let result = execute_command(&self.workspace_root, program, args);
-        if matches!(result, Dispatch::Continue { ok: true, .. }) {
-            self.successful_commands_since_change.insert(key);
-        }
+        let result = self.execute_command_with_expectations(&command);
+        self.record_command_observation(key, &result);
         result
+    }
+
+    fn record_command_observation(&mut self, _key: String, result: &Dispatch) {
+        if let Dispatch::Continue { result, .. } = result {
+            self.latest_command = Some(CommandObservation {
+                summary: summarize_command_result(result),
+            });
+        }
+    }
+
+    fn execute_command_with_expectations(&self, command: &ProposedCommand) -> Dispatch {
+        let expectation_state = match command_expectation_state(
+            &self.workspace_root,
+            &self.extra_ignore_patterns,
+            command,
+        ) {
+            Ok(state) => state,
+            Err(message) => {
+                return Dispatch::Continue {
+                    result: command_failure_result(
+                        "expectation_snapshot_error",
+                        &render_command(&command.program, &command.args),
+                        &message,
+                        Vec::new(),
+                    ),
+                    ok: false,
+                };
+            }
+        };
+        let known_project_dirs: Vec<String> = discover_project_roots(
+            Path::new(&self.workspace_root),
+            &self.written_paths.iter().cloned().collect::<Vec<_>>(),
+        )
+        .into_iter()
+        .filter_map(|(dir, _)| (!dir.is_empty()).then_some(dir))
+        .collect();
+        let result = execute_command(
+            &self.workspace_root,
+            command.cwd.as_deref(),
+            &command.program,
+            &command.args,
+            &known_project_dirs,
+        );
+        verify_command_expectations(
+            &self.workspace_root,
+            &self.extra_ignore_patterns,
+            command,
+            expectation_state,
+            result,
+        )
     }
 
     fn materialize_session_files(&self) -> Result<(), String> {
@@ -1422,369 +1341,75 @@ impl<'a, P: ToolProvider> AgentSession<'a, P> {
         Ok(())
     }
 
-    fn queue_install_dependencies(&mut self, path: Option<&str>) -> Dispatch {
-        let requested = path.unwrap_or(".").trim();
-        let install_dir = match self.install_directory_for(requested) {
-            Ok(dir) => dir,
-            Err(e) => {
-                return Dispatch::Continue {
-                    result: format!("Error: {e}"),
-                    ok: false,
-                };
-            }
-        };
-        let command = match self.install_command_for_dir(&install_dir) {
-            Ok(cmd) => cmd,
-            Err(e) => {
-                return Dispatch::Continue {
-                    result: format!("Error: {e}"),
-                    ok: false,
-                };
-            }
-        };
-        if self
-            .queued_setup_commands
-            .iter()
-            .any(|existing| existing == &command)
-        {
-            return Dispatch::Continue {
-                result: format!(
-                    "Install already queued for '{}': {} {}",
-                    install_dir,
-                    command.program,
-                    command.args.join(" ")
-                )
-                .trim()
-                .to_string(),
-                ok: true,
-            };
-        }
-        self.queued_setup_commands.push(command.clone());
-        self.successful_commands_since_change.clear();
-        Dispatch::Continue {
-            result: format!(
-                "Queued dependency install for '{}': {} {}. The runtime will run this after apply.",
-                install_dir,
-                command.program,
-                command.args.join(" ")
-            )
-            .trim()
-            .to_string(),
-            ok: true,
-        }
-    }
-
-    fn install_directory_for(&self, requested: &str) -> Result<String, String> {
-        let trimmed = requested.trim();
-        if trimmed.is_empty() {
-            return Ok(".".into());
-        }
-        let manifest_names = [
-            "package.json",
-            "package-lock.json",
-            "pnpm-lock.yaml",
-            "yarn.lock",
-            "bun.lock",
-            "bun.lockb",
-            "pyproject.toml",
-            "requirements.txt",
-            "Cargo.toml",
-            "go.mod",
-        ];
-        let raw = Path::new(trimmed);
-        let candidate = if raw
-            .file_name()
-            .and_then(|name| name.to_str())
-            .map(|name| manifest_names.contains(&name))
-            .unwrap_or(false)
-        {
-            match raw.parent() {
-                Some(parent) if !parent.as_os_str().is_empty() => parent,
-                _ => Path::new("."),
-            }
-        } else {
-            raw
-        };
-        let canonical = resolve_in_workspace(&self.workspace_root, &candidate.to_string_lossy())?;
-        if !canonical.is_dir() {
-            return Err(format!(
-                "'{}' is not a directory. Pass a workspace directory or manifest path.",
-                trimmed
-            ));
-        }
-        let root = Path::new(&self.workspace_root)
-            .canonicalize()
-            .map_err(|e| format!("workspace root invalid: {e}"))?;
-        let rel = canonical.strip_prefix(&root).unwrap_or(&canonical);
-        let rel_str = rel.to_string_lossy();
-        let final_dir = if rel_str.is_empty() {
-            ".".into()
-        } else {
-            rel_str.into_owned()
-        };
-        if final_dir != "." {
-            return Err(format!(
-                "install_dependencies currently supports only the workspace root; '{}' is a subdirectory.",
-                final_dir
-            ));
-        }
-        Ok(final_dir)
-    }
-
-    fn install_command_for_dir(&self, install_dir: &str) -> Result<ProposedCommand, String> {
-        let dir = if install_dir == "." {
-            PathBuf::new()
-        } else {
-            PathBuf::from(install_dir)
-        };
-        let has = |name: &str| self.session_path_exists(&dir.join(name));
-
-        if has("package.json") {
-            let command = if has("pnpm-lock.yaml") || has("pnpm-workspace.yaml") {
-                ProposedCommand {
-                    program: "pnpm".into(),
-                    args: vec!["install".into()],
-                }
-            } else if has("yarn.lock") {
-                ProposedCommand {
-                    program: "yarn".into(),
-                    args: vec!["install".into()],
-                }
-            } else if has("bun.lock") || has("bun.lockb") {
-                ProposedCommand {
-                    program: "bun".into(),
-                    args: vec!["install".into()],
-                }
-            } else {
-                ProposedCommand {
-                    program: "npm".into(),
-                    args: vec!["install".into()],
-                }
-            };
-            return Ok(command);
-        }
-
-        if has("requirements.txt") {
-            return Ok(ProposedCommand {
-                program: "python3".into(),
-                args: vec![
-                    "-m".into(),
-                    "pip".into(),
-                    "install".into(),
-                    "-r".into(),
-                    "requirements.txt".into(),
-                ],
-            });
-        }
-
-        if has("pyproject.toml") {
-            return Ok(ProposedCommand {
-                program: "python3".into(),
-                args: vec![
-                    "-m".into(),
-                    "pip".into(),
-                    "install".into(),
-                    "-e".into(),
-                    ".".into(),
-                ],
-            });
-        }
-
-        if has("Cargo.toml") {
-            return Ok(ProposedCommand {
-                program: "cargo".into(),
-                args: vec!["fetch".into()],
-            });
-        }
-
-        if has("go.mod") {
-            return Ok(ProposedCommand {
-                program: "go".into(),
-                args: vec!["mod".into(), "download".into()],
-            });
-        }
-
-        Err(format!(
-            "could not determine install command for '{}'. Expected package.json, requirements.txt, pyproject.toml, Cargo.toml, or go.mod.",
-            install_dir
-        ))
-    }
-
-    fn session_path_exists(&self, rel: &Path) -> bool {
-        let rel_str = rel.to_string_lossy().into_owned();
-        if self
-            .ops
-            .iter()
-            .any(|op| matches!(op, ProposedFileOp::Delete { path } if path == &rel_str))
-        {
-            return false;
-        }
-        if self.file_state.contains_key(&rel_str)
-            || self.ops.iter().any(|op| {
-                matches!(op,
-                    ProposedFileOp::Create { path, .. } | ProposedFileOp::Edit { path, .. }
-                    if path == &rel_str)
-            })
-        {
-            return true;
-        }
-        resolve_in_workspace(&self.workspace_root, &rel_str)
-            .map(|abs| abs.exists())
-            .unwrap_or(false)
-    }
-
-    fn dispatch_command(&mut self, action: &AgentAction) -> Dispatch {
-        match action.command_action.as_deref().unwrap_or("") {
-            "run" => self.dispatch_run_command(action),
-            "install_dependencies" => self.queue_install_dependencies(action.path.as_deref()),
-            "start_service" => {
-                let name = action.service_name.as_deref().unwrap_or("");
-                let line = action.command_line.as_deref().unwrap_or("");
-                self.start_service(name, line)
-            }
-            "status_service" => {
-                let name = action.service_name.as_deref().unwrap_or("");
-                self.status_service(name)
-            }
-            "stop_service" => {
-                let name = action.service_name.as_deref().unwrap_or("");
-                self.stop_service(name)
-            }
-            "" => Dispatch::Continue {
-                result: "Error: command_action is required. Use run, install_dependencies, start_service, status_service, or stop_service.".into(),
-                ok: false,
-            },
-            other => Dispatch::Continue {
-                result: format!(
-                    "Error: unknown command_action '{other}'. Use run, install_dependencies, start_service, status_service, or stop_service."
-                ),
-                ok: false,
-            },
-        }
-    }
-
     fn dispatch_run_command(&mut self, action: &AgentAction) -> Dispatch {
-        if let Some(line) = action
-            .command_line
-            .as_deref()
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-        {
-            let argv = match split_command_line(line) {
-                Ok(argv) => argv,
-                Err(e) => {
-                    return Dispatch::Continue {
-                        result: format!("Error parsing command_line: {e}"),
-                        ok: false,
-                    };
-                }
-            };
-            if argv.is_empty() {
-                return Dispatch::Continue {
-                    result: "Error: command_line did not contain a program".into(),
-                    ok: false,
-                };
-            }
-            return self.execute_deduped_command(format!("line:{line}"), &argv[0], &argv[1..]);
+        let command = match command_spec(action) {
+            Ok(command) => command,
+            Err(result) => return result,
+        };
+        if let Err(result) = validate_command_spec(&command) {
+            return result;
         }
+        self.execute_deduped_command(
+            command_key(&command.program, &command.args),
+            &command.program,
+            &command.args,
+            command.cwd.clone(),
+        )
+    }
 
-        let (cmd, tail): (&str, &[String]) =
-            if action.cmd.as_deref().unwrap_or("").is_empty() && !action.args.is_empty() {
-                (action.args[0].as_str(), &action.args[1..])
-            } else {
-                (action.cmd.as_deref().unwrap_or(""), &action.args)
-            };
-        if cmd.is_empty() {
-            return Dispatch::Continue {
-                result: "Error: command_action=run requires command_line, or cmd plus args. Example: {\"tool\":\"command\",\"command_action\":\"run\",\"command_line\":\"cargo check\"}".into(),
-                ok: false,
-            };
+    /// Render a loaded file as a self-contained tool result: a `<file>` block with
+    /// REAL line numbers. Stored once in `conv_history` (append-only) so the model
+    /// always has current line numbers without a per-turn full re-dump.
+    fn render_loaded_file(&self, path: &str, contents: &str) -> String {
+        let kw_owned = task_keywords(&self.current_task);
+        let kw_refs: Vec<&str> = kw_owned.iter().map(String::as_str).collect();
+        let numbered = render_file_numbered(contents, &kw_refs);
+        let total = contents.lines().count();
+        format!(
+            "Loaded '{path}' ({total} lines — line numbers shown, use them with edit):\n\
+             <file path=\"{path}\">\n{numbered}</file>"
+        )
+    }
+
+    /// Produce edit content from the inline tool payload. Empty content is a
+    /// valid delete signal for range edits.
+    fn resolve_edit_content(
+        &self,
+        inline: Option<&str>,
+        is_append: bool,
+    ) -> crate::InferResult<String> {
+        let _ = self;
+        match inline {
+            Some(content) => Ok(content.to_string()),
+            None if !is_append => Ok(String::new()),
+            None => Err(crate::InferError::InvalidOutput {
+                retries: 0,
+                reason: "edit content missing from tool call".into(),
+            }),
         }
-        self.execute_deduped_command(command_key(cmd, tail), cmd, tail)
     }
 
     fn dispatch(&mut self, action: AgentAction) -> Dispatch {
         match action.tool.as_str() {
-            "think" => {
-                let thought = action.query.as_deref().unwrap_or("").trim();
-                if thought.is_empty() {
-                    return Dispatch::Continue {
-                        result: "Error: think requires a non-empty query with your reasoning."
-                            .into(),
-                        ok: false,
-                    };
-                }
-                // Guard 1: cap total think calls — prevents think-loop burn-through.
-                let think_count = self
-                    .turns
-                    .iter()
-                    .filter(|t| t.tool == "think" && t.ok)
-                    .count();
-                let edited_before = self.turns.iter().any(|t| {
-                    t.ok && matches!(
-                        t.tool.as_str(),
-                        "write_file" | "replace_lines" | "delete_file"
-                    )
-                });
-                if edited_before {
-                    return Dispatch::Continue {
-                        result: "Error: files have already been edited. Do not think again. Act now: read/edit the next required file, use command if verification is necessary, or done."
-                            .into(),
-                        ok: false,
-                    };
-                }
-                if think_count >= 3 {
-                    return Dispatch::Continue {
-                        result: "Error: you have already thought 3 times. \
-                                 No more think calls allowed. Act now — \
-                                 call read_file, write_file, replace_lines, command, or done."
-                            .into(),
-                        ok: false,
-                    };
-                }
-                // Guard 2: reject consecutive think — one thought, then act.
-                let prev_was_think = self
-                    .turns
-                    .last()
-                    .map(|t| t.tool == "think" && t.ok)
-                    .unwrap_or(false);
-                if prev_was_think {
-                    return Dispatch::Continue {
-                        result: "Error: you just thought. Act now — call read_file, \
-                                 write_file, replace_lines, command, or done. \
-                                 You may think again after your next action."
-                            .into(),
-                        ok: false,
-                    };
-                }
-                // Return the thought as the result so it appears verbatim in turn history.
-                Dispatch::Continue {
-                    result: thought.to_string(),
-                    ok: true,
-                }
-            }
-
-            // Surgical edit for small models: the model addresses the edit by
-            // LINE NUMBER (from a line-numbered read — which it can do reliably),
-            // the replacement CONTENT is collected via generate_text, and the file
-            // is reassembled deterministically by shunt-edit. The model never has
-            // to reproduce exact existing text (the broken str_replace approach).
-            "replace_lines" => {
+            // `edit` with start_line: surgical line-range replacement/append/delete.
+            // The model addresses by LINE NUMBER (from a line-numbered read), and the
+            // file is reassembled deterministically by shunt-edit.
+            "edit" if action.start_line.is_some() => {
                 let path = action.path.as_deref().unwrap_or("").to_string();
                 let start = action.start_line.unwrap_or(0);
                 let end = action.end_line.unwrap_or(start).max(start);
                 if path.is_empty() {
                     return Dispatch::Continue {
-                        result: "Error: path is required for replace_lines. \
-                                 Example: {\"tool\":\"replace_lines\",\"path\":\"src/foo.rs\",\"start_line\":1,\"end_line\":1}".into(),
+                        result: "Error: path is required for edit. \
+                                 Example: {\"tool\":\"edit\",\"path\":\"src/foo.rs\",\"start_line\":1,\"end_line\":1}".into(),
                         ok: false,
                     };
                 }
                 if start == 0 {
                     return Dispatch::Continue {
                         result: "Error: start_line is required (1-indexed). \
-                                 Call read_file first to see line numbers, then use replace_lines with the correct start_line and end_line. \
-                                 Example: {\"tool\":\"replace_lines\",\"path\":\"src/foo.rs\",\"start_line\":3,\"end_line\":3}".into(),
+                                 Call read_file first to see line numbers, then use edit with the correct start_line and end_line. \
+                                 Example: {\"tool\":\"edit\",\"path\":\"src/foo.rs\",\"start_line\":3,\"end_line\":3}".into(),
                         ok: false,
                     };
                 }
@@ -1859,7 +1484,7 @@ impl<'a, P: ToolProvider> AgentSession<'a, P> {
                         shunt_edit::numbered_window(&current, 1, current.lines().count());
                     return Dispatch::Continue {
                         result: format!(
-                            "Error: this replace_lines range already produced no file change: \
+                            "Error: this edit range already produced no file change: \
                              {path}:{start}-{end}. Current file:\n{current_view}\n\
                              Choose a different or broader range, or switch to another file that \
                              is required by the task. Do not repeat this range."
@@ -1912,7 +1537,7 @@ impl<'a, P: ToolProvider> AgentSession<'a, P> {
                     }
                     s
                 };
-                let (text_system, base_user) = if is_append {
+                let (_text_system, _base_user) = if is_append {
                     let sys = "You output ONLY new source code to append to the file — \
                         no explanation, no markdown fences, no line numbers. \
                         Do NOT reproduce existing file content. Output only the new lines to add.";
@@ -1937,16 +1562,9 @@ impl<'a, P: ToolProvider> AgentSession<'a, P> {
                     );
                     (sys, base)
                 };
-                if let Some(o) = &self.observer {
-                    if is_append {
-                        o.on_note(&format!("Generating content to append to {path}…"));
-                    } else {
-                        o.on_note(&format!(
-                            "Generating replacement for {path} lines {start}-{end}…"
-                        ));
-                    }
-                }
-                let new_content = match self.provider.generate_text(text_system, &base_user) {
+                let new_content = match self
+                    .resolve_edit_content(action.content.as_deref(), is_append)
+                {
                     Ok(g) => {
                         let s = strip_code_fences(g.trim());
                         // Empty string is valid: means "delete these lines".
@@ -1961,7 +1579,7 @@ impl<'a, P: ToolProvider> AgentSession<'a, P> {
                     Err(e) => {
                         return Dispatch::Continue {
                             result: format!(
-                                "Error: replacement generation failed for '{path}': {e}"
+                                "Error: replacement content missing or invalid for '{path}': {e}"
                             ),
                             ok: false,
                         };
@@ -2020,7 +1638,7 @@ impl<'a, P: ToolProvider> AgentSession<'a, P> {
                                     "Error: no effective edit — {reason}. Current file:\n\
                                      {current_view}\n\
                                      If the task is not satisfied, choose a different or broader \
-                                     replace_lines range that covers the stale code. Do not repeat \
+                                     edit range that covers the stale code. Do not repeat \
                                      the same edit."
                                 ),
                                 ok: false,
@@ -2032,7 +1650,6 @@ impl<'a, P: ToolProvider> AgentSession<'a, P> {
                             shunt_edit::numbered_window(&updated, 1, updated.lines().count());
                         let warning = structural_warning_text(&updated, &path);
                         self.ineffective_edit_ranges.clear();
-                        self.successful_commands_since_change.clear();
                         self.ops.push(ProposedFileOp::Create {
                             path: path.clone(),
                             contents: updated,
@@ -2043,7 +1660,7 @@ impl<'a, P: ToolProvider> AgentSession<'a, P> {
                             format!(
                                 "OK — appended to '{path}'. Current file:\n{updated_view}\n\
                                  {warning}\
-                                 Edit applied. Call done now, or replace_lines on a \
+                                 Edit applied. Call done now, or edit on a \
                                  different file/range if more changes are needed."
                             )
                         } else {
@@ -2051,7 +1668,7 @@ impl<'a, P: ToolProvider> AgentSession<'a, P> {
                                 "OK — replaced lines {start}-{applied_end} in '{path}'. Current file:\n\
                                  {updated_view}\n\
                                  {warning}\
-                                 Edit applied. Call done now, or replace_lines on a \
+                                 Edit applied. Call done now, or edit on a \
                                  different file/range if more changes are needed."
                             )
                         };
@@ -2067,51 +1684,8 @@ impl<'a, P: ToolProvider> AgentSession<'a, P> {
                 }
             }
 
-            "apply_patch" => {
-                let path = action.path.as_deref().unwrap_or("");
-                let patch = action.patch.as_deref().unwrap_or("");
-                if patch.is_empty() {
-                    return Dispatch::Continue {
-                        result: "Error: patch is empty. Provide a unified diff with @@ hunks."
-                            .into(),
-                        ok: false,
-                    };
-                }
-                let snapshot_before = self.file_state.get(path).cloned().unwrap_or_default();
-                let result = apply_unified_patch(&mut self.file_state, path, patch);
-                let ok = result.starts_with("OK");
-                if ok {
-                    self.ineffective_edit_ranges.clear();
-                    self.successful_commands_since_change.clear();
-                    let snapshot_after = self.file_state.get(path).cloned().unwrap_or_default();
-                    self.ops.push(ProposedFileOp::Edit {
-                        path: path.to_string(),
-                        search: snapshot_before,
-                        replacement: snapshot_after,
-                    });
-                }
-                Dispatch::Continue { result, ok }
-            }
-
-            "str_replace" => {
-                let path = action.path.as_deref().unwrap_or("");
-                let old_str = action.old_str.as_deref().unwrap_or("");
-                let new_str = action.new_str.as_deref().unwrap_or("");
-                let result = apply_str_replace(&mut self.file_state, path, old_str, new_str);
-                let ok = result == "OK";
-                if ok {
-                    self.ineffective_edit_ranges.clear();
-                    self.successful_commands_since_change.clear();
-                    self.ops.push(ProposedFileOp::Edit {
-                        path: path.to_string(),
-                        search: old_str.to_string(),
-                        replacement: new_str.to_string(),
-                    });
-                }
-                Dispatch::Continue { result, ok }
-            }
-
-            "write_file" => {
+            // `edit` without start_line: create a new file (errors if it already exists).
+            "edit" => {
                 let raw_path = action.path.as_deref().unwrap_or("").to_string();
                 let abs_path = match resolve_in_workspace(&self.workspace_root, &raw_path) {
                     Ok(p) => p,
@@ -2127,54 +1701,44 @@ impl<'a, P: ToolProvider> AgentSession<'a, P> {
                     .unwrap_or(&abs_path)
                     .to_string_lossy()
                     .into_owned();
-                // write_file is for NEW files only. Existing files must be edited
-                // with replace_lines (which handles replace, append, and delete).
                 if self.file_state.contains_key(&path) {
                     let n = self.file_state[&path].lines().count();
                     return Dispatch::Continue {
                         result: format!(
                             "Error: '{path}' already exists ({n} lines). \
-                             Use replace_lines to edit it. \
+                             To modify it, use edit with start_line and end_line. \
                              To append, use start_line={} (one past the last line).",
                             n + 1
                         ),
                         ok: false,
                     };
                 }
-                // If the model already put content in the `query` field, use it directly —
-                // BUT only for NEW files (not yet in file_state). For existing files, always
-                // use the two-step so the "NEWLY CREATED files" context can be injected,
-                // ensuring the model sees what new files need to be registered/imported.
-                let file_already_exists = self.file_state.contains_key(&path);
-                if let Some(inline) = action.query.as_deref().filter(|s| !s.trim().is_empty()) {
-                    if file_already_exists {
-                        // Fall through to two-step for existing files.
-                    } else {
-                        let contents = inline.to_string();
-                        if let Some(parent) = abs_path.parent() {
-                            let _ = std::fs::create_dir_all(parent);
-                        }
-                        if let Err(e) = std::fs::write(&abs_path, &contents) {
-                            return Dispatch::Continue {
-                                result: format!("Error writing '{path}': {e}"),
-                                ok: false,
-                            };
-                        }
-                        self.file_state.insert(path.clone(), contents.clone());
-                        self.ineffective_edit_ranges.clear();
-                        self.successful_commands_since_change.clear();
-                        self.ops.push(ProposedFileOp::Create {
-                            path: path.clone(),
-                            contents,
-                        });
-                        self.written_paths.insert(path.clone());
+                // Single-shot: the model supplies the new file's content inline. (Existing
+                // files are rejected above, so this always creates a brand-new file.)
+                if let Some(inline) = action.content.as_deref().filter(|s| !s.trim().is_empty()) {
+                    let contents = inline.to_string();
+                    if let Some(parent) = abs_path.parent() {
+                        let _ = std::fs::create_dir_all(parent);
+                    }
+                    if let Err(e) = std::fs::write(&abs_path, &contents) {
                         return Dispatch::Continue {
-                            result: format!("OK — '{path}' written to disk."),
-                            ok: true,
+                            result: format!("Error writing '{path}': {e}"),
+                            ok: false,
                         };
-                    } // close else (non-no-op inline content)
+                    }
+                    self.file_state.insert(path.clone(), contents.clone());
+                    self.ineffective_edit_ranges.clear();
+                    self.ops.push(ProposedFileOp::Create {
+                        path: path.clone(),
+                        contents,
+                    });
+                    self.written_paths.insert(path.clone());
+                    return Dispatch::Continue {
+                        result: format!("OK — '{path}' written to disk."),
+                        ok: true,
+                    };
                 }
-                // No inline content (or inline was no-op) — fall through to two-step.
+                // No inline content — fall through to two-phase generation.
                 let task = &self.current_task;
                 let current = self.file_state.get(&path).cloned().unwrap_or_default();
                 // Include other loaded files as context, capped to avoid bloating the prompt.
@@ -2317,7 +1881,6 @@ impl<'a, P: ToolProvider> AgentSession<'a, P> {
                 }
                 self.file_state.insert(path.clone(), contents.clone());
                 self.ineffective_edit_ranges.clear();
-                self.successful_commands_since_change.clear();
                 self.ops.push(ProposedFileOp::Create {
                     path: path.clone(),
                     contents,
@@ -2325,41 +1888,6 @@ impl<'a, P: ToolProvider> AgentSession<'a, P> {
                 self.written_paths.insert(path.clone());
                 Dispatch::Continue {
                     result: format!("OK — '{path}' written to disk."),
-                    ok: true,
-                }
-            }
-
-            "delete_file" => {
-                let raw_path = action.path.as_deref().unwrap_or("").to_string();
-                let abs_path = match resolve_in_workspace(&self.workspace_root, &raw_path) {
-                    Ok(p) => p,
-                    Err(e) => {
-                        return Dispatch::Continue {
-                            result: format!("Error: {e}"),
-                            ok: false,
-                        };
-                    }
-                };
-                let path = abs_path
-                    .strip_prefix(&self.workspace_root)
-                    .unwrap_or(&abs_path)
-                    .to_string_lossy()
-                    .into_owned();
-                if let Err(e) = std::fs::remove_file(&abs_path) {
-                    // Only fail if file actually exists; missing = already deleted.
-                    if e.kind() != std::io::ErrorKind::NotFound {
-                        return Dispatch::Continue {
-                            result: format!("Error deleting '{path}': {e}"),
-                            ok: false,
-                        };
-                    }
-                }
-                self.file_state.remove(&path);
-                self.ineffective_edit_ranges.clear();
-                self.successful_commands_since_change.clear();
-                self.ops.push(ProposedFileOp::Delete { path });
-                Dispatch::Continue {
-                    result: "OK — file deleted from disk.".into(),
                     ok: true,
                 }
             }
@@ -2393,16 +1921,13 @@ impl<'a, P: ToolProvider> AgentSession<'a, P> {
                     };
                 }
                 // Check file_state first — covers files written/edited in this session
-                // but not yet on disk (write_file and str_replace update file_state).
-                if let Some(contents) = self.file_state.get(path) {
-                    let size = contents.len();
-                    // Return an error so the model knows to stop re-reading and move on.
+                // but not yet on disk (edit updates file_state on each successful call).
+                // History is append-only: re-reading returns the CURRENT numbered content
+                // so the model always sees up-to-date line numbers without a per-turn re-dump.
+                if let Some(contents) = self.file_state.get(path).cloned() {
                     Dispatch::Continue {
-                        result: format!(
-                            "Error: '{path}' ({size} bytes) is already loaded — it is visible in the FILES section above. \
-                             Do not read it again. Proceed to write_file or done."
-                        ),
-                        ok: false,
+                        result: self.render_loaded_file(path, &contents),
+                        ok: true,
                     }
                 } else {
                     match std::fs::read_to_string(&abs_path) {
@@ -2419,9 +1944,9 @@ impl<'a, P: ToolProvider> AgentSession<'a, P> {
                                     ok: false,
                                 };
                             }
-                            self.file_state.insert(path.to_string(), contents);
+                            self.file_state.insert(path.to_string(), contents.clone());
                             Dispatch::Continue {
-                                result: format!("(loaded {size} bytes — see FILES section above)"),
+                                result: self.render_loaded_file(path, &contents),
                                 ok: true,
                             }
                         }
@@ -2443,346 +1968,71 @@ impl<'a, P: ToolProvider> AgentSession<'a, P> {
                 Dispatch::Continue { ok: true, result }
             }
 
-            "command" => self.dispatch_command(&action),
-
-            "run_command_line" => {
-                let line = action.command_line.as_deref().unwrap_or("").trim();
-                if line.is_empty() {
+            "knowledge" => {
+                let query = action.query.as_deref().unwrap_or("").trim();
+                if query.is_empty() {
                     return Dispatch::Continue {
-                        result: "Error: command_line is required. Example: {\"tool\":\"run_command_line\",\"command_line\":\"cargo check\"}".into(),
+                        result: "Error: knowledge requires a non-empty query (e.g. a package name, API, or topic).".into(),
                         ok: false,
                     };
                 }
-                let argv = match split_command_line(line) {
-                    Ok(argv) => argv,
-                    Err(e) => {
-                        return Dispatch::Continue {
-                            result: format!("Error parsing command_line: {e}"),
+                match &self.knowledge {
+                    Some(backend) => match backend.lookup(query) {
+                        Ok(evidence) => Dispatch::Continue {
+                            result: evidence,
+                            ok: true,
+                        },
+                        Err(e) => Dispatch::Continue {
+                            result: format!("Knowledge lookup failed: {e}"),
                             ok: false,
-                        };
-                    }
-                };
-                if argv.is_empty() {
-                    return Dispatch::Continue {
-                        result: "Error: command_line did not contain a program".into(),
+                        },
+                    },
+                    None => Dispatch::Continue {
+                        result: "Error: no knowledge backend is available in this session.".into(),
                         ok: false,
-                    };
+                    },
                 }
-                self.execute_deduped_command(format!("line:{line}"), &argv[0], &argv[1..])
             }
 
-            "run_command" => {
-                // Auto-fix: model sometimes puts the program name as args[0] instead of cmd.
-                // e.g. {"args": ["ls", "-R"]} instead of {"cmd": "ls", "args": ["-R"]}
-                let (cmd, tail): (&str, &[String]) =
-                    if action.cmd.as_deref().unwrap_or("").is_empty() && !action.args.is_empty() {
-                        (action.args[0].as_str(), &action.args[1..])
-                    } else {
-                        (action.cmd.as_deref().unwrap_or(""), &action.args)
-                    };
-                if cmd.is_empty() {
-                    return Dispatch::Continue {
-                        result: "Error: cmd is required. Example: {\"tool\":\"run_command\",\"cmd\":\"ls\",\"args\":[\"-la\"]}".into(),
-                        ok: false,
-                    };
-                }
-                self.execute_deduped_command(command_key(cmd, tail), cmd, tail)
-            }
-
-            "install_dependencies" => self.queue_install_dependencies(action.path.as_deref()),
-
-            "start_service" => {
-                let name = action.service_name.as_deref().unwrap_or("");
-                let line = action.command_line.as_deref().unwrap_or("");
-                self.start_service(name, line)
-            }
-
-            "status_service" => {
-                let name = action.service_name.as_deref().unwrap_or("");
-                self.status_service(name)
-            }
-
-            "stop_service" => {
-                let name = action.service_name.as_deref().unwrap_or("");
-                self.stop_service(name)
-            }
+            "command" => self.dispatch_run_command(&action),
 
             "ask_user" => Dispatch::NeedsClarification {
                 question: action.question.unwrap_or_else(|| "?".into()),
                 context: action.context.unwrap_or_default(),
             },
 
-            "sub_agent" => {
-                let task = action.task.as_deref().unwrap_or("").to_string();
-                let context = action.context.as_deref().unwrap_or("");
-                let full_task = if context.is_empty() {
-                    task.clone()
-                } else {
-                    format!("{task}\nContext: {context}")
+            "done" => {
+                let setup_commands = match action
+                    .setup_commands
+                    .iter()
+                    .map(|spec| parse_command_line(&spec.command_line, spec.cwd.clone()))
+                    .collect::<Result<Vec<_>, _>>()
+                {
+                    Ok(commands) => commands,
+                    Err(result) => return result,
                 };
-                let mut sub = AgentSession::new_sub(self.provider, &self.workspace_root);
-                sub.extra_ignore_patterns = self.extra_ignore_patterns.clone();
-                // Warm sub with parent's current file_state so it doesn't re-read files.
-                for (k, v) in &self.file_state {
-                    sub.file_state.insert(k.clone(), v.clone());
+                Dispatch::Done {
+                    description: action
+                        .description
+                        .unwrap_or_else(|| "Applied changes".into()),
+                    setup_commands,
+                    criteria: action
+                        .criteria
+                        .into_iter()
+                        .map(RawCriterion::into_outcome)
+                        .collect(),
                 }
-                let sub_result = sub.run(&full_task);
-                // Merge sub's file edits back into parent state.
-                for (path, content) in std::mem::take(&mut sub.file_state) {
-                    self.file_state.insert(path, content);
-                }
-                self.ops.extend(std::mem::take(&mut sub.ops));
-                let result = match sub_result {
-                    AgentResult::Done {
-                        description,
-                        setup_commands,
-                        ..
-                    } => {
-                        for cmd in setup_commands {
-                            if !self
-                                .queued_setup_commands
-                                .iter()
-                                .any(|existing| existing == &cmd)
-                            {
-                                self.queued_setup_commands.push(cmd);
-                            }
-                        }
-                        description
-                    }
-                    AgentResult::MaxTurnsReached => {
-                        "Sub-agent hit turn limit without a result.".into()
-                    }
-                    AgentResult::NeedsClarification { question, .. } => {
-                        format!("Sub-agent was unsure: {question}")
-                    }
-                };
-                Dispatch::Continue { result, ok: true }
             }
-
-            "done" => Dispatch::Done {
-                description: action
-                    .description
-                    .unwrap_or_else(|| "Applied changes".into()),
-                setup_commands: action.setup_commands,
-            },
 
             other => Dispatch::Continue {
                 result: format!(
                     "Unknown tool '{other}'. Available tools: \
-                      think, read_file, search_files, write_file, \
-                     replace_lines, delete_file, command, ask_user, sub_agent, done. \
-                      Correct the tool name and try again."
+                     read_file, search_files, edit, command, ask_user, done. \
+                     Correct the tool name and try again."
                 ),
                 ok: false,
             },
         }
-    }
-}
-
-// ── apply_str_replace — 4-tier progressive matching ──────────────────────────
-
-pub(crate) fn apply_str_replace(
-    file_state: &mut HashMap<String, String>,
-    path: &str,
-    old_str: &str,
-    new_str: &str,
-) -> String {
-    if old_str.is_empty() {
-        return "Error: old_str is empty.".to_string();
-    }
-    if old_str == new_str {
-        return "Error: old_str and new_str are identical — no change would be made.".to_string();
-    }
-    let current = match file_state.get(path) {
-        Some(c) => c.clone(),
-        None => {
-            return format!(
-                "Error: file '{path}' not found in context. Use read_file to load it first."
-            );
-        }
-    };
-
-    // Tier 1: exact match
-    let count = current.matches(old_str).count();
-    if count > 1 {
-        return format!(
-            "Error: old_str appears {count} times in '{path}'. \
-             Include more surrounding lines to make it unique."
-        );
-    }
-    if count == 1 {
-        let updated = current.replacen(old_str, new_str, 1);
-        file_state.insert(path.to_string(), updated);
-        return "OK".to_string();
-    }
-
-    // Tier 2: right-strip trailing whitespace on each line
-    if let Some(updated) = fuzzy_replace(&current, old_str, new_str, |l| l.trim_end().to_string()) {
-        file_state.insert(path.to_string(), updated);
-        return "OK".to_string();
-    }
-
-    // Tier 3: full trim (handles indent differences)
-    if let Some(updated) = fuzzy_replace(&current, old_str, new_str, |l| l.trim().to_string()) {
-        file_state.insert(path.to_string(), updated);
-        return "OK".to_string();
-    }
-
-    // Tier 4: unicode normalization + right-strip (smart quotes, em-dash, etc.)
-    if let Some(updated) = fuzzy_replace(&current, old_str, new_str, |l| {
-        normalize_unicode(l.trim_end())
-    }) {
-        file_state.insert(path.to_string(), updated);
-        return "OK".to_string();
-    }
-
-    format!(
-        "Error: old_str not found in '{path}' after exact, whitespace-flexible, \
-         and unicode-normalized matching. Verify the text appears in the FILES section."
-    )
-}
-
-/// Line-by-line fuzzy replace: normalize each line, find a unique window match,
-/// replace those original lines with new_str.
-fn fuzzy_replace(
-    content: &str,
-    old_str: &str,
-    new_str: &str,
-    normalize: impl Fn(&str) -> String,
-) -> Option<String> {
-    let content_lines: Vec<&str> = content.lines().collect();
-    let old_lines: Vec<&str> = old_str.lines().collect();
-    if old_lines.is_empty() {
-        return None;
-    }
-    let norm_content: Vec<String> = content_lines.iter().map(|l| normalize(l)).collect();
-    let norm_old: Vec<String> = old_lines.iter().map(|l| normalize(l)).collect();
-    let window = old_lines.len();
-
-    let mut match_starts: Vec<usize> = Vec::new();
-    'outer: for i in 0..=content_lines.len().saturating_sub(window) {
-        for j in 0..window {
-            if norm_content[i + j] != norm_old[j] {
-                continue 'outer;
-            }
-        }
-        match_starts.push(i);
-    }
-
-    if match_starts.len() != 1 {
-        return None; // not found or ambiguous
-    }
-
-    let start = match_starts[0];
-    let end = start + window;
-    let new_lines: Vec<&str> = new_str.lines().collect();
-
-    let mut result_lines: Vec<&str> = Vec::new();
-    result_lines.extend_from_slice(&content_lines[..start]);
-    result_lines.extend(new_lines.iter().copied());
-    result_lines.extend_from_slice(&content_lines[end..]);
-
-    let mut result = result_lines.join("\n");
-    if content.ends_with('\n') && !result.ends_with('\n') {
-        result.push('\n');
-    }
-    Some(result)
-}
-
-fn normalize_unicode(s: &str) -> String {
-    s.replace(['\u{2018}', '\u{2019}'], "'")
-        .replace(['\u{201C}', '\u{201D}'], "\"")
-        .replace('\u{2013}', "-") // en dash
-        .replace('\u{2014}', "--") // em dash
-}
-
-// ── apply_unified_patch ───────────────────────────────────────────────────────
-
-/// Parse a unified diff and apply each hunk via apply_str_replace (with fuzzy matching).
-fn apply_unified_patch(
-    file_state: &mut HashMap<String, String>,
-    path: &str,
-    patch: &str,
-) -> String {
-    let mut hunks: Vec<(String, String)> = Vec::new();
-    let mut in_hunk = false;
-    let mut old_parts: Vec<String> = Vec::new();
-    let mut new_parts: Vec<String> = Vec::new();
-
-    let flush = |old_parts: &mut Vec<String>,
-                 new_parts: &mut Vec<String>,
-                 hunks: &mut Vec<(String, String)>| {
-        let old_str = old_parts.join("\n");
-        let new_str = new_parts.join("\n");
-        if !old_str.is_empty() || !new_str.is_empty() {
-            hunks.push((old_str, new_str));
-        }
-        old_parts.clear();
-        new_parts.clear();
-    };
-
-    for line in patch.lines() {
-        if line.starts_with("---") || line.starts_with("+++") {
-            // File header lines — end current hunk if any
-            if in_hunk {
-                flush(&mut old_parts, &mut new_parts, &mut hunks);
-                in_hunk = false;
-            }
-            continue;
-        }
-        if line.starts_with("@@") {
-            if in_hunk {
-                flush(&mut old_parts, &mut new_parts, &mut hunks);
-            }
-            in_hunk = true;
-            continue;
-        }
-        if in_hunk {
-            if let Some(rest) = line.strip_prefix('-') {
-                old_parts.push(rest.to_string());
-            } else if let Some(rest) = line.strip_prefix('+') {
-                new_parts.push(rest.to_string());
-            } else if let Some(rest) = line.strip_prefix(' ') {
-                // Context line — present in both old and new
-                old_parts.push(rest.to_string());
-                new_parts.push(rest.to_string());
-            }
-            // Lines with no diff prefix (bare text) — treat as context
-            else if !line.is_empty() {
-                old_parts.push(line.to_string());
-                new_parts.push(line.to_string());
-            }
-        }
-    }
-    if in_hunk {
-        flush(&mut old_parts, &mut new_parts, &mut hunks);
-    }
-
-    if hunks.is_empty() {
-        return "Error: no hunks found in patch. Use unified diff format with @@ markers and - / + prefixed lines.".to_string();
-    }
-
-    let mut applied = 0usize;
-    let mut errors: Vec<String> = Vec::new();
-    for (old_str, new_str) in &hunks {
-        let result = apply_str_replace(file_state, path, old_str, new_str);
-        if result == "OK" {
-            applied += 1;
-        } else {
-            errors.push(result);
-        }
-    }
-
-    if errors.is_empty() {
-        format!("OK — {applied} hunk(s) applied")
-    } else if applied > 0 {
-        format!(
-            "Partial: {applied}/{} hunk(s) applied. Errors: {}",
-            hunks.len(),
-            errors.join("; ")
-        )
-    } else {
-        format!("Error: {}", errors.join("; "))
     }
 }
 
@@ -2832,7 +2082,8 @@ fn search_files_in_workspace(workspace_root: &str, query: &str, extra_ignore: &[
         .collect();
     if hits.is_empty() {
         format!(
-            "No files found for '{query}'. Try a different keyword, or call search_files with empty query to list all files."
+            "No files found for '{query}'. Listing workspace files instead:\n{}",
+            list_workspace_files(workspace_root, extra_ignore)
         )
     } else {
         hits.join("\n")
@@ -2865,13 +2116,32 @@ fn list_workspace_files(workspace_root: &str, extra_ignore: &[String]) -> String
 
 // ── System prompt builder ─────────────────────────────────────────────────────
 
-fn build_system_prompt(workspace_root: &str) -> String {
+fn build_system_prompt(
+    workspace_root: &str,
+    single_shot_edits: bool,
+    has_knowledge: bool,
+) -> String {
     let root = Path::new(workspace_root);
     let gi = build_ignore_matcher(workspace_root, &[]);
     let tree = build_dir_tree(root, 0, 3, &mut 0, 60, &gi);
     let manifests = read_manifest_files(root);
 
-    let mut prompt = AGENT_SYSTEM_PROMPT_BASE.to_string();
+    let os_name = match std::env::consts::OS {
+        "macos" => "macOS",
+        "windows" => "Windows",
+        _ => "Linux",
+    };
+    let mut prompt = AGENT_SYSTEM_PROMPT_BASE
+        .replace("{{TOOLS}}", &tools_doc(false, has_knowledge))
+        .replace("{{OS}}", os_name);
+    if single_shot_edits {
+        prompt.push_str(
+            "\n\nWhen you call edit, put the FULL code in the `content` field of the SAME action — \
+             do not split it into a separate step. When modifying (start_line given), `content` \
+             is the new text for lines start_line..end_line only (omit it to delete the range). \
+             When creating (no start_line), `content` is the whole new file.",
+        );
+    }
     prompt.push_str("\n\n---\n\n## Workspace\n\n");
     prompt.push_str(&format!("Root: {workspace_root}\n\n"));
 
@@ -2891,45 +2161,48 @@ fn build_system_prompt(workspace_root: &str) -> String {
     prompt
 }
 
-const VERIFIER_SYSTEM_PROMPT_BASE: &str = "\
-You are a QA engineer verifying that a coding agent's changes actually work.
-Each response is ONE JSON action. You do NOT write or modify files.
+const VERIFIER_SYSTEM_PROMPT_BASE: &str = include_str!("../../../prompts/verifier.system.txt");
 
-APPROACH:
-1. The changed files are already pre-loaded — read them to understand what was implemented.
-2. Run the build first to confirm no compilation errors.
-   Node/TypeScript → command {\"command_action\":\"run\",\"command_line\":\"pnpm build\"}
-   Rust            → command {\"command_action\":\"run\",\"command_line\":\"cargo check\"}
-3. Run surgical smoke tests matched to what changed:
-   - New HTTP route → command start_service for the dev server, command run curl, command stop_service
-   - New component   → inspect build output for warnings / missing exports
-   - Modified logic  → run the existing test suite if one is present
-4. Call done with EXACTLY this format in description:
-   PASS: <what was tested and confirmed working>
-   — or —
-   FAIL: <specific what broke, exact error output>
-
-CONSTRAINTS:
-- Never call write_file, str_replace, or delete_file — read-only.
-- For long-running dev servers or daemons, use command actions start_service/status_service/stop_service. Do NOT wrap servers in timeout or background shell syntax.
-- Keep scope surgical — only test what the changes touch.
-- If the build fails, stop there and report FAIL with the error.
-
-Available tools: think, read_file, search_files, command, done";
-
-fn build_verifier_prompt(workspace_root: &str) -> String {
+fn build_verifier_prompt(workspace_root: &str, changed_paths: &[String]) -> String {
     let root = Path::new(workspace_root);
     let gi = build_ignore_matcher(workspace_root, &[]);
     let manifests = read_manifest_files(root);
+    let project_roots = discover_project_roots(root, changed_paths);
 
-    let mut prompt = VERIFIER_SYSTEM_PROMPT_BASE.to_string();
+    let mut prompt = VERIFIER_SYSTEM_PROMPT_BASE.replace("{{TOOLS}}", &tools_doc(true, false));
     prompt.push_str("\n\n---\n\n## Workspace\n\n");
     prompt.push_str(&format!("Root: {workspace_root}\n\n"));
+
+    // Derived from the changed files, not a blind directory scan: tells the model
+    // exactly which directory (if any) to pass as cwd for build/test commands,
+    // instead of guessing or defaulting to the workspace root.
+    let non_root: Vec<&(String, String)> = project_roots
+        .iter()
+        .filter(|(dir, _)| !dir.is_empty())
+        .collect();
+    if !non_root.is_empty() {
+        prompt.push_str("### Project Directories (derived from changed files)\n");
+        for (dir, manifest_name) in &non_root {
+            prompt.push_str(&format!(
+                "- `{dir}` (has {manifest_name}) — run build/test commands for this project with cwd=\"{dir}\"\n"
+            ));
+        }
+        prompt.push('\n');
+    }
 
     if !manifests.is_empty() {
         prompt.push_str("### Key Files\n");
         for (name, contents) in &manifests {
             prompt.push_str(&format!("\n#### {name}\n```\n{contents}\n```\n"));
+        }
+    }
+    for (dir, manifest_name) in &non_root {
+        let path = root.join(dir).join(manifest_name);
+        if let Ok(contents) = std::fs::read_to_string(&path) {
+            let capped: String = contents.lines().take(200).collect::<Vec<_>>().join("\n");
+            prompt.push_str(&format!(
+                "\n#### {dir}/{manifest_name}\n```\n{capped}\n```\n"
+            ));
         }
     }
 
@@ -3022,41 +2295,91 @@ fn read_manifest_files(root: &Path) -> Vec<(String, String)> {
     result
 }
 
+/// Discover manifest-bearing directories relevant to the given workspace-relative
+/// changed paths: for each changed file, walk its directory chain up to the
+/// workspace root checking for a known manifest (the same language-generic
+/// `MANIFEST_NAMES` list used everywhere else). Driven entirely by files that
+/// actually changed, not a blind recursive scan of the whole tree — bounded by
+/// `changed_paths.len() * directory depth`.
+///
+/// An empty directory string means the workspace root itself. Language-agnostic
+/// by construction: it works for any manifest already in `MANIFEST_NAMES`
+/// (Cargo.toml, go.mod, pyproject.toml, requirements.txt, deno.json, package.json).
+fn discover_project_roots(root: &Path, changed_paths: &[String]) -> Vec<(String, String)> {
+    let mut found = Vec::new();
+    let mut seen_dirs = HashSet::new();
+
+    let mut check_dir = |dir: &Path, found: &mut Vec<(String, String)>| {
+        let rel = dir.to_string_lossy().to_string();
+        let rel = if rel == "." { String::new() } else { rel };
+        if !seen_dirs.insert(rel.clone()) {
+            return;
+        }
+        for name in MANIFEST_NAMES {
+            if root.join(dir).join(name).is_file() {
+                found.push((rel.clone(), (*name).to_string()));
+                break;
+            }
+        }
+    };
+
+    check_dir(Path::new(""), &mut found);
+    for changed in changed_paths {
+        let mut dir = Path::new(changed).parent();
+        while let Some(d) = dir {
+            check_dir(d, &mut found);
+            if d.as_os_str().is_empty() {
+                break;
+            }
+            dir = d.parent();
+        }
+    }
+    found
+}
+
 // ── Multi-turn context helpers ────────────────────────────────────────────────
 
 /// Soft token ceiling for `conv_history` (excludes system + task frame + ephemeral).
-/// ~4 chars per token; 2000 tokens ≈ 8KB. With a -c 8192 server this leaves
-/// ~400 tokens for the system prompt, ~2000 for the ephemeral continuation
-/// (FILES section), and ~3000 for model output.
+/// ~4 chars per token; 2000 tokens ≈ 8KB. File content now lives in append-only
+/// history (the read/edit results), so this budget governs how much of that history
+/// stays hot before eviction kicks in.
 const HISTORY_TOKEN_SOFT_LIMIT: usize = 2000;
 
-/// Build the ephemeral continuation message (FILES + nudge) that is appended to
-/// the last message in the inference payload every turn.  NOT stored in
-/// `conv_history` — rebuilt fresh so line numbers and nudge text are always current.
+/// Build the ephemeral continuation message appended to the last message each turn.
+/// NOT stored in `conv_history` — rebuilt fresh so the index and nudge are current.
+///
+/// File CONTENT is no longer dumped here: read/edit results carry their own numbered
+/// content into the append-only history. This message only carries a compact
+/// loaded-files index, an unloaded-files hint, and the contextual nudge, so the
+/// merged-into-last-message tail stays small and the KV-cached prefix is preserved.
+#[allow(clippy::too_many_arguments)]
 fn build_continuation_msg(
     task: &str,
     file_state: &HashMap<String, String>,
     ops: &[ProposedFileOp],
     turns: &[AgentTurn],
+    latest_command: Option<&CommandObservation>,
+    remaining_without_progress: usize,
     workspace_root: &str,
     budget: &SessionBudget,
 ) -> String {
-    let kw_refs = task_keywords(task);
-    let kw_refs: Vec<&str> = kw_refs.iter().map(String::as_str).collect();
-
     let mut msg = String::new();
 
-    msg.push_str(&environment_profile(workspace_root));
+    // Environment profile (workspace root + available commands) is static for the
+    // session — emit it once on the first turn, not every turn.
+    if turns.is_empty() {
+        msg.push_str(&environment_profile(workspace_root));
+    }
 
-    // Files section — always shows the CURRENT state with real line numbers.
+    // Compact index of loaded files (names + line counts only — content is in the
+    // read/edit results already in history).
     let mut paths: Vec<&String> = file_state.keys().collect();
     paths.sort();
     if !paths.is_empty() {
-        msg.push_str("FILES (line numbers shown — use them with replace_lines):\n");
+        msg.push_str("LOADED FILES (content shown in earlier read/edit results; re-read for current line numbers if unsure):\n");
         for path in &paths {
-            let contents = &file_state[*path];
-            let numbered = render_file_numbered(contents, &kw_refs);
-            msg.push_str(&format!("\n<file path=\"{path}\">\n{numbered}</file>\n"));
+            let lines = file_state[*path].lines().count();
+            msg.push_str(&format!("  {path} ({lines} lines)\n"));
         }
     }
 
@@ -3068,8 +2391,22 @@ fn build_continuation_msg(
         msg.push('\n');
     }
 
+    if let Some(command) = latest_command {
+        msg.push_str("\nLATEST COMMAND RESULT:\n");
+        msg.push_str(&command.summary);
+        msg.push_str("\nTreat this as new evidence. Usually inspect, edit, queue setup, or choose a different command before retrying unchanged.\n");
+    }
+
     // Contextual nudge based on turn history.
-    msg.push_str(&build_nudge(task, file_state, ops, turns, budget));
+    msg.push_str(&build_nudge(
+        task,
+        file_state,
+        ops,
+        turns,
+        latest_command,
+        remaining_without_progress,
+        budget,
+    ));
     msg
 }
 
@@ -3154,18 +2491,185 @@ fn split_command_line(input: &str) -> Result<Vec<String>, String> {
     Ok(args)
 }
 
+/// Parse a terminal-style command line into a `ProposedCommand`. Expectation
+/// fields are runtime bookkeeping, not model input — they default to empty here.
+fn parse_command_line(line: &str, cwd: Option<String>) -> Result<ProposedCommand, Dispatch> {
+    let argv = split_command_line(line.trim()).map_err(|e| Dispatch::Continue {
+        result: format!("Error parsing command_line: {e}"),
+        ok: false,
+    })?;
+    let Some((program, args)) = argv.split_first() else {
+        return Err(Dispatch::Continue {
+            result: "Error: command_line is empty. Provide the command as you would type it, e.g. {\"command_line\":\"npm run build\"}.".into(),
+            ok: false,
+        });
+    };
+    Ok(ProposedCommand {
+        program: program.clone(),
+        args: args.to_vec(),
+        cwd,
+        expect_workspace_change: false,
+        expect_paths: Vec::new(),
+    })
+}
+
+fn command_spec(action: &AgentAction) -> Result<ProposedCommand, Dispatch> {
+    let line = action.command_line.as_deref().unwrap_or("").trim();
+    if line.is_empty() {
+        return Err(Dispatch::Continue {
+            result:
+                "Error: command requires command_line, e.g. {\"command_line\":\"npm run build\"}."
+                    .into(),
+            ok: false,
+        });
+    }
+    parse_command_line(line, action.cwd.clone())
+}
+
+fn validate_command_spec(command: &ProposedCommand) -> Result<(), Dispatch> {
+    if command.program.trim().is_empty() {
+        return Err(Dispatch::Continue {
+            result: command_failure_result(
+                "missing_program",
+                "",
+                "Command is missing a program. Provide command_line as you would type it in a terminal.",
+                Vec::new(),
+            ),
+            ok: false,
+        });
+    }
+    validate_direct_argv(&command.program, &command.args)
+        .map_err(|result| Dispatch::Continue { result, ok: false })
+}
+
+fn validate_direct_argv(cmd: &str, args: &[String]) -> Result<(), String> {
+    let argv = std::iter::once(cmd.to_string())
+        .chain(args.iter().cloned())
+        .collect::<Vec<_>>();
+    if let Some(op) = args
+        .iter()
+        .find(|arg| matches!(arg.as_str(), "&&" | "||" | ";" | "|" | ">" | ">>" | "<"))
+    {
+        return Err(command_failure_result(
+            "unsupported_shell_operator",
+            &render_command(cmd, args),
+            &format!(
+                "Shell operator '{op}' is unsupported because the command executes argv directly, not through a shell. Use one command_line per call."
+            ),
+            split_shell_operator_recovery(&argv),
+        ));
+    }
+    if args.is_empty() && is_bare_interactive_command(cmd) {
+        return Err(command_failure_result(
+            "interactive_command_without_args",
+            cmd,
+            &format!(
+                "'{cmd}' without args is interactive or non-actionable. Use explicit args like '{cmd} --version', or the full intended command line."
+            ),
+            vec![ProposedCommand {
+                program: cmd.to_string(),
+                args: vec!["--version".into()],
+                cwd: None,
+                expect_workspace_change: false,
+                expect_paths: vec![],
+            }],
+        ));
+    }
+    Ok(())
+}
+
+fn split_shell_operator_recovery(argv: &[String]) -> Vec<ProposedCommand> {
+    let mut commands = Vec::new();
+    let mut current: Vec<String> = Vec::new();
+    let mut pending_cwd: Option<String> = None;
+    for token in argv {
+        if matches!(token.as_str(), "&&" | "||" | ";") {
+            // `cd PATH` sets the working directory for the next command rather
+            // than emitting a useless cd subprocess (cd is a shell builtin).
+            if current.len() == 2 && current[0] == "cd" {
+                pending_cwd = Some(current[1].clone());
+                current.clear();
+            } else {
+                push_recovery_command(&mut commands, &mut current, pending_cwd.take());
+            }
+        } else if matches!(token.as_str(), "|" | ">" | ">>" | "<") {
+            return Vec::new();
+        } else {
+            current.push(token.clone());
+        }
+    }
+    // trailing `cd PATH` with no following command — nothing to emit
+    if !(current.len() == 2 && current[0] == "cd") {
+        push_recovery_command(&mut commands, &mut current, pending_cwd.take());
+    }
+    commands
+}
+
+fn push_recovery_command(
+    commands: &mut Vec<ProposedCommand>,
+    current: &mut Vec<String>,
+    cwd: Option<String>,
+) {
+    if current.is_empty() {
+        return;
+    }
+    commands.push(ProposedCommand {
+        program: current[0].clone(),
+        args: current[1..].to_vec(),
+        cwd,
+        expect_workspace_change: false,
+        expect_paths: vec![],
+    });
+    current.clear();
+}
+
+fn is_bare_interactive_command(cmd: &str) -> bool {
+    let Some(name) = std::path::Path::new(cmd)
+        .file_name()
+        .and_then(|n| n.to_str())
+    else {
+        return false;
+    };
+    matches!(
+        name,
+        "bash"
+            | "fish"
+            | "irb"
+            | "node"
+            | "npm"
+            | "php"
+            | "psql"
+            | "python"
+            | "python3"
+            | "ruby"
+            | "sh"
+            | "sqlite3"
+            | "zsh"
+    )
+}
+
 fn check_command_safety(cmd: &str, args: &[String]) -> Result<(), Dispatch> {
     // Apply the shared safety classifier (shunt_core::safety). Command-line input
     // is parsed into argv first; nothing is executed through a shell here.
     let spec = shunt_core::CommandSpec::new(cmd, args.iter().map(String::as_str));
     match safety::classify(&spec) {
         safety::CommandSafety::Blocked { reason } => Err(Dispatch::Continue {
-            result: format!("Error: command blocked — {reason}"),
+            result: command_failure_result(
+                "safety_blocked",
+                &spec.display(),
+                &format!("Command blocked by safety policy: {reason}"),
+                Vec::new(),
+            ),
             ok: false,
         }),
         safety::CommandSafety::Dangerous { reason } => Err(Dispatch::Continue {
-            result: format!(
-                "Error: command requires approval — {reason}. Use done.setup_commands for commands that need user review."
+            result: command_failure_result(
+                "requires_approval",
+                &spec.display(),
+                &format!(
+                    "Command requires approval: {reason}. Queue it as setup if it is required for the final task, or ask the user."
+                ),
+                Vec::new(),
             ),
             ok: false,
         }),
@@ -3173,8 +2677,216 @@ fn check_command_safety(cmd: &str, args: &[String]) -> Result<(), Dispatch> {
     }
 }
 
+fn is_likely_long_running_command(cmd: &str, args: &[String]) -> bool {
+    let Some(name) = std::path::Path::new(cmd)
+        .file_name()
+        .and_then(|n| n.to_str())
+    else {
+        return false;
+    };
+
+    let first = args.first().map(String::as_str);
+    let second = args.get(1).map(String::as_str);
+
+    if args
+        .iter()
+        .any(|arg| matches!(arg.as_str(), "--watch" | "-w"))
+    {
+        return true;
+    }
+
+    if matches!(name, "vite" | "next" | "nuxt" | "astro")
+        && matches!(first, Some("dev" | "start" | "preview"))
+    {
+        return true;
+    }
+
+    if matches!(name, "npm" | "pnpm" | "yarn" | "bun")
+        && matches!(first, Some("run"))
+        && matches!(
+            second,
+            Some("dev" | "start" | "serve" | "watch" | "preview")
+        )
+    {
+        return true;
+    }
+
+    if matches!(name, "cargo") && matches!(first, Some("watch")) {
+        return true;
+    }
+
+    false
+}
+
 fn command_key(cmd: &str, args: &[String]) -> String {
     format!("argv:{}", render_command(cmd, args))
+}
+
+fn command_expectation_state(
+    workspace_root: &str,
+    extra_ignore: &[String],
+    command: &ProposedCommand,
+) -> Result<CommandExpectationState, String> {
+    let workspace_fingerprint = if command.expect_workspace_change {
+        Some(workspace_fingerprint(workspace_root, extra_ignore)?)
+    } else {
+        None
+    };
+    Ok(CommandExpectationState {
+        workspace_fingerprint,
+    })
+}
+
+fn verify_command_expectations(
+    workspace_root: &str,
+    extra_ignore: &[String],
+    command: &ProposedCommand,
+    before: CommandExpectationState,
+    result: Dispatch,
+) -> Dispatch {
+    let Dispatch::Continue {
+        ok: true,
+        result: detail,
+    } = result
+    else {
+        return result;
+    };
+    let (exit_code, stdout, stderr) = command_outcome_streams(&detail);
+
+    if !command.expect_paths.is_empty() {
+        let mut missing = Vec::new();
+        for path in &command.expect_paths {
+            let abs = match resolve_in_workspace(workspace_root, path) {
+                Ok(abs) => abs,
+                Err(e) => {
+                    return Dispatch::Continue {
+                        result: command_failure_result(
+                            "invalid_expect_path",
+                            &render_command(&command.program, &command.args),
+                            &format!("Invalid expect_paths entry '{path}': {e}"),
+                            Vec::new(),
+                        ),
+                        ok: false,
+                    };
+                }
+            };
+            if !abs.exists() {
+                missing.push(path.clone());
+            }
+        }
+        if !missing.is_empty() {
+            return Dispatch::Continue {
+                result: command_failure_outcome_result(
+                    "expected_paths_missing",
+                    &render_command(&command.program, &command.args),
+                    exit_code,
+                    &stdout,
+                    &stderr,
+                    &format!(
+                        "Command finished but did not produce the expected path(s): {}",
+                        missing.join(", ")
+                    ),
+                ),
+                ok: false,
+            };
+        }
+    }
+
+    if let Some(before_fingerprint) = before.workspace_fingerprint {
+        match workspace_fingerprint(workspace_root, extra_ignore) {
+            Ok(after_fingerprint) if after_fingerprint == before_fingerprint => {
+                return Dispatch::Continue {
+                    result: command_failure_outcome_result(
+                        "expected_workspace_change_missing",
+                        &render_command(&command.program, &command.args),
+                        exit_code,
+                        &stdout,
+                        &stderr,
+                        "Command finished but did not change the workspace.",
+                    ),
+                    ok: false,
+                };
+            }
+            Err(message) => {
+                return Dispatch::Continue {
+                    result: command_failure_result(
+                        "expectation_snapshot_error",
+                        &render_command(&command.program, &command.args),
+                        &message,
+                        Vec::new(),
+                    ),
+                    ok: false,
+                };
+            }
+            _ => {}
+        }
+    }
+
+    Dispatch::Continue {
+        result: detail,
+        ok: true,
+    }
+}
+
+fn command_outcome_streams(detail: &str) -> (i32, String, String) {
+    let Ok(value) = serde_json::from_str::<Value>(detail) else {
+        return (0, String::new(), String::new());
+    };
+    let Some(obj) = value.as_object() else {
+        return (0, String::new(), String::new());
+    };
+    let exit_code = obj
+        .get("exit_code")
+        .and_then(Value::as_i64)
+        .and_then(|n| i32::try_from(n).ok())
+        .unwrap_or(0);
+    let stdout = obj
+        .get("stdout")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
+    let stderr = obj
+        .get("stderr")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
+    (exit_code, stdout, stderr)
+}
+
+fn workspace_fingerprint(workspace_root: &str, extra_ignore: &[String]) -> Result<u64, String> {
+    use std::hash::{Hash, Hasher};
+
+    let root = Path::new(workspace_root);
+    let gi = build_ignore_matcher(workspace_root, extra_ignore);
+    let walker = ignore::WalkBuilder::new(root).hidden(true).build();
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    for entry in walker.flatten() {
+        let path = entry.path();
+        if path == root
+            || gi
+                .matched_path_or_any_parents(path, path.is_dir())
+                .is_ignore()
+        {
+            continue;
+        }
+        let rel = path
+            .strip_prefix(root)
+            .unwrap_or(path)
+            .to_string_lossy()
+            .to_string();
+        rel.hash(&mut hasher);
+        if let Ok(meta) = entry.metadata() {
+            meta.is_dir().hash(&mut hasher);
+            meta.len().hash(&mut hasher);
+            if let Ok(modified) = meta.modified()
+                && let Ok(since_epoch) = modified.duration_since(std::time::UNIX_EPOCH)
+            {
+                since_epoch.as_secs().hash(&mut hasher);
+                since_epoch.subsec_nanos().hash(&mut hasher);
+            }
+        }
+    }
+    Ok(hasher.finish())
 }
 
 fn render_command(cmd: &str, args: &[String]) -> String {
@@ -3184,18 +2896,179 @@ fn render_command(cmd: &str, args: &[String]) -> String {
         .join(" ")
 }
 
-fn execute_command(workspace_root: &str, cmd: &str, args: &[String]) -> Dispatch {
+fn command_failure_result(
+    failure_kind: &str,
+    command: &str,
+    message: &str,
+    recovery: Vec<ProposedCommand>,
+) -> String {
+    let recovery = recovery
+        .into_iter()
+        .map(|command| {
+            json!({
+                "program": command.program,
+                "args": command.args,
+            })
+        })
+        .collect::<Vec<_>>();
+    serde_json::to_string_pretty(&json!({
+        "status": "failed",
+        "failure_kind": failure_kind,
+        "command": command,
+        "message": message,
+        "recovery": recovery,
+    }))
+    .unwrap_or_else(|_| message.to_string())
+}
+
+fn summarize_command_result(result: &str) -> String {
+    let Ok(value) = serde_json::from_str::<Value>(result) else {
+        return result.lines().next().unwrap_or(result).trim().to_string();
+    };
+    let Some(obj) = value.as_object() else {
+        return result.lines().next().unwrap_or(result).trim().to_string();
+    };
+    let status = obj.get("status").and_then(Value::as_str).unwrap_or("");
+    let command = obj
+        .get("command")
+        .and_then(Value::as_str)
+        .unwrap_or("command");
+    let failure_kind = obj
+        .get("failure_kind")
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    let message = obj.get("message").and_then(Value::as_str).map(str::trim);
+    let stderr = obj.get("stderr").and_then(Value::as_str).map(str::trim);
+    let stdout = obj.get("stdout").and_then(Value::as_str).map(str::trim);
+    match status {
+        "success" => format!("{command} succeeded"),
+        "failed" => {
+            let detail = message
+                .filter(|s| !s.is_empty())
+                .or_else(|| stderr.filter(|s| !s.is_empty()))
+                .or_else(|| stdout.filter(|s| !s.is_empty()))
+                .unwrap_or("failed");
+            if failure_kind.is_empty() {
+                format!("{command} failed: {detail}")
+            } else {
+                format!("{command} failed [{failure_kind}]: {detail}")
+            }
+        }
+        _ => result.lines().next().unwrap_or(result).trim().to_string(),
+    }
+}
+
+fn turn_evidence_key(tool: &str, result: &str) -> String {
+    match tool {
+        "command" => summarize_command_result(result),
+        _ => result.trim().to_string(),
+    }
+}
+
+fn latest_command_observation(turns: &[AgentTurn]) -> Option<CommandObservation> {
+    turns.iter().rev().find_map(|turn| {
+        if matches!(turn.tool.as_str(), "command") {
+            Some(CommandObservation {
+                summary: summarize_command_result(&turn.result),
+            })
+        } else {
+            None
+        }
+    })
+}
+
+fn command_success_result(command: &str, exit_code: i32, stdout: &str, stderr: &str) -> String {
+    serde_json::to_string_pretty(&json!({
+        "status": "success",
+        "command": command,
+        "exit_code": exit_code,
+        "stdout": stdout,
+        "stderr": stderr,
+    }))
+    .unwrap_or_else(|_| format!("{command}: success"))
+}
+
+fn command_failure_outcome_result(
+    failure_kind: &str,
+    command: &str,
+    exit_code: i32,
+    stdout: &str,
+    stderr: &str,
+    message: &str,
+) -> String {
+    serde_json::to_string_pretty(&json!({
+        "status": "failed",
+        "failure_kind": failure_kind,
+        "command": command,
+        "exit_code": exit_code,
+        "stdout": stdout,
+        "stderr": stderr,
+        "message": message,
+        "recovery": [],
+    }))
+    .unwrap_or_else(|_| message.to_string())
+}
+
+/// Generic hint appended to execution failures when no `cwd` was set and other
+/// changed files reveal a project directory elsewhere in the workspace. Not tied
+/// to any language or package manager — it fires for any command (cargo, npm,
+/// go, pip, ...) whenever `discover_project_roots` found a manifest outside the
+/// workspace root, so the model doesn't have to be told about each tool by name.
+fn cwd_hint(cwd: Option<&str>, known_project_dirs: &[String]) -> String {
+    if cwd.is_some() || known_project_dirs.is_empty() {
+        return String::new();
+    }
+    let plural = if known_project_dirs.len() == 1 {
+        "y"
+    } else {
+        "ies"
+    };
+    format!(
+        " Known project director{plural} in this workspace (based on files touched so far): {}. \
+         If this command targets one of them, set cwd accordingly.",
+        known_project_dirs.join(", ")
+    )
+}
+
+fn execute_command(
+    workspace_root: &str,
+    cwd: Option<&str>,
+    cmd: &str,
+    args: &[String],
+    known_project_dirs: &[String],
+) -> Dispatch {
+    if let Err(result) = validate_direct_argv(cmd, args) {
+        return Dispatch::Continue { result, ok: false };
+    }
     if let Err(result) = check_command_safety(cmd, args) {
         return result;
     }
+    let rendered = render_command(cmd, args);
+    if is_likely_long_running_command(cmd, args) {
+        return Dispatch::Continue {
+            result: command_failure_result(
+                "long_running_command_not_supported",
+                &rendered,
+                "This command is likely to start a long-running dev server or watcher. Commands must be finite — finish the task without starting a persistent process.",
+                Vec::new(),
+            ),
+            ok: false,
+        };
+    }
+
+    let wd = match cwd {
+        Some(rel) => std::path::Path::new(workspace_root).join(rel),
+        None => std::path::PathBuf::from(workspace_root),
+    };
 
     // Execvp-style: cmd is the program, args are its arguments.
     // Stdout/stderr drained on threads to prevent pipe-buffer deadlock.
     // Hard timeout kills the child so a hung build doesn't block forever.
-    const AGENT_CMD_TIMEOUT_SECS: u64 = 60;
+    const AGENT_CMD_TIMEOUT_SECS: u64 = 120;
     let mut child = match std::process::Command::new(cmd)
         .args(args)
-        .current_dir(workspace_root)
+        .current_dir(&wd)
+        .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .spawn()
@@ -3203,7 +3076,17 @@ fn execute_command(workspace_root: &str, cmd: &str, args: &[String]) -> Dispatch
         Ok(c) => c,
         Err(e) => {
             return Dispatch::Continue {
-                result: format!("Error spawning '{cmd}': {e}"),
+                result: command_failure_outcome_result(
+                    "spawn_error",
+                    &rendered,
+                    -1,
+                    "",
+                    "",
+                    &format!(
+                        "Error spawning '{cmd}': {e}.{}",
+                        cwd_hint(cwd, known_project_dirs)
+                    ),
+                ),
                 ok: false,
             };
         }
@@ -3233,9 +3116,7 @@ fn execute_command(workspace_root: &str, cmd: &str, args: &[String]) -> Dispatch
                 if std::time::Instant::now() >= deadline {
                     let _ = child.kill();
                     let _ = child.wait();
-                    break Err(format!(
-                        "timed out after {AGENT_CMD_TIMEOUT_SECS}s — process killed"
-                    ));
+                    break Err("timeout".to_string());
                 }
                 std::thread::sleep(std::time::Duration::from_millis(50));
             }
@@ -3249,58 +3130,48 @@ fn execute_command(workspace_root: &str, cmd: &str, args: &[String]) -> Dispatch
             let stdout = tail_utf8(&stdout_bytes, MAX_CMD_OUTPUT);
             let stderr = tail_utf8(&stderr_bytes, MAX_CMD_OUTPUT);
             let ok = status.success();
-            let result = if stderr.is_empty() {
-                stdout
+            let exit_code = status.code().unwrap_or(-1);
+            let result = if ok {
+                command_success_result(&rendered, exit_code, &stdout, &stderr)
             } else {
-                format!("stdout:\n{stdout}\nstderr:\n{stderr}")
+                command_failure_outcome_result(
+                    "nonzero_exit",
+                    &rendered,
+                    exit_code,
+                    &stdout,
+                    &stderr,
+                    &format!(
+                        "Command exited with a nonzero status. Inspect stdout/stderr, fix the cause, then retry only after making a relevant change.{}",
+                        cwd_hint(cwd, known_project_dirs)
+                    ),
+                )
             };
-            Dispatch::Continue {
-                result: result.trim().to_string(),
-                ok,
-            }
+            Dispatch::Continue { result, ok }
         }
-        Err(msg) => Dispatch::Continue {
-            result: format!("Error: {msg}"),
+        Err(msg) if msg == "timeout" => Dispatch::Continue {
+            result: command_failure_outcome_result(
+                "timeout",
+                &rendered,
+                -1,
+                &tail_utf8(&stdout_bytes, MAX_CMD_OUTPUT),
+                &tail_utf8(&stderr_bytes, MAX_CMD_OUTPUT),
+                &format!(
+                    "Command timed out after {AGENT_CMD_TIMEOUT_SECS}s and was killed. Commands must be finite — do not run dev servers, watchers, or other long-running processes."
+                ),
+            ),
             ok: false,
         },
-    }
-}
-
-fn spawn_log_reader<R: Read + Send + 'static>(mut reader: R, sink: Arc<Mutex<Vec<u8>>>) {
-    std::thread::spawn(move || {
-        let mut chunk = [0u8; 8192];
-        loop {
-            match reader.read(&mut chunk) {
-                Ok(0) => break,
-                Ok(n) => {
-                    if let Ok(mut buf) = sink.lock() {
-                        buf.extend_from_slice(&chunk[..n]);
-                        if buf.len() > MAX_CMD_OUTPUT * 4 {
-                            let keep_from = buf.len() - MAX_CMD_OUTPUT * 4;
-                            buf.drain(..keep_from);
-                        }
-                    }
-                }
-                Err(_) => break,
-            }
-        }
-    });
-}
-
-fn service_logs(stdout: &Arc<Mutex<Vec<u8>>>, stderr: &Arc<Mutex<Vec<u8>>>) -> String {
-    let stdout = stdout
-        .lock()
-        .map(|b| tail_utf8(&b, MAX_CMD_OUTPUT))
-        .unwrap_or_default();
-    let stderr = stderr
-        .lock()
-        .map(|b| tail_utf8(&b, MAX_CMD_OUTPUT))
-        .unwrap_or_default();
-    match (stdout.trim().is_empty(), stderr.trim().is_empty()) {
-        (true, true) => "logs: <empty>".into(),
-        (false, true) => format!("stdout:\n{}", stdout.trim()),
-        (true, false) => format!("stderr:\n{}", stderr.trim()),
-        (false, false) => format!("stdout:\n{}\nstderr:\n{}", stdout.trim(), stderr.trim()),
+        Err(msg) => Dispatch::Continue {
+            result: command_failure_outcome_result(
+                "wait_error",
+                &rendered,
+                -1,
+                &tail_utf8(&stdout_bytes, MAX_CMD_OUTPUT),
+                &tail_utf8(&stderr_bytes, MAX_CMD_OUTPUT),
+                &msg,
+            ),
+            ok: false,
+        },
     }
 }
 
@@ -3571,31 +3442,28 @@ fn build_nudge(
     file_state: &HashMap<String, String>,
     ops: &[ProposedFileOp],
     turns: &[AgentTurn],
+    latest_command: Option<&CommandObservation>,
+    remaining_without_progress: usize,
     budget: &SessionBudget,
 ) -> String {
     if turns.is_empty() {
-        return "\nStart with think to reason about the approach, then explore what you need. \
+        return "\nReason about the approach, then explore what you need. \
                 What is your first action?"
             .into();
     }
-    let remaining = budget.max_turns.saturating_sub(turns.len());
+    let remaining = remaining_without_progress;
     let idle_streak = turns
         .iter()
         .rev()
-        .take_while(|t| matches!(t.tool.as_str(), "think" | "read_file" | "search_files"))
+        .take_while(|t| matches!(t.tool.as_str(), "read_file" | "search_files"))
         .count();
-    let wrote_any = turns.iter().any(|t| {
-        matches!(
-            t.tool.as_str(),
-            "write_file" | "str_replace" | "delete_file" | "replace_lines"
-        ) && t.ok
-    });
-    let last_verified = turns.iter().rev().find(|t| {
-        matches!(
-            t.tool.as_str(),
-            "command" | "run_command" | "run_command_line"
-        )
-    });
+    let wrote_any = turns
+        .iter()
+        .any(|t| matches!(t.tool.as_str(), "edit" | "delete_file") && t.ok);
+    let last_verified = turns
+        .iter()
+        .rev()
+        .find(|t| matches!(t.tool.as_str(), "command"));
     let last_verified_ok = last_verified
         .map(|t| {
             t.ok && !t.result.to_ascii_lowercase().contains("error")
@@ -3603,14 +3471,16 @@ fn build_nudge(
         })
         .unwrap_or(false);
     let last_action = turns.last().map(|t| t.tool.as_str()).unwrap_or("");
-    let last_action_ok = turns.last().map(|t| t.ok).unwrap_or(false);
     let missing_explicit_paths = missing_explicit_file_edits(task, file_state, ops);
+    let latest_command_failed = latest_command
+        .map(|command| command.summary.contains(" failed"))
+        .unwrap_or(false);
 
     if idle_streak >= budget.stall_warn_at {
         format!(
-            "\nSTALL WARNING: {idle_streak} turns of reading/thinking without any edit or command. \
-             You MUST call write_file, replace_lines, command, or done NOW. \
-             No more reads or thinks. ({remaining} turns remaining)"
+            "\nSTALL WARNING: {idle_streak} turns of reading without any edit or command. \
+             You MUST call edit, command, or done NOW. \
+             No more reads. ({remaining} turns remaining)"
         )
     } else if wrote_any && !missing_explicit_paths.is_empty() {
         format!(
@@ -3621,32 +3491,30 @@ fn build_nudge(
         )
     } else if last_action == "done" {
         String::new()
-    } else if wrote_any
-        && matches!(last_action, "command" | "run_command" | "run_command_line")
-        && last_verified_ok
-    {
+    } else if wrote_any && matches!(last_action, "command") && last_verified_ok {
         format!(
             "\nBuild passed. Call done with a description of what changed and what was verified. \
              ({remaining} turns remaining)"
         )
-    } else if wrote_any
-        && matches!(last_action, "command" | "run_command" | "run_command_line")
-        && !last_verified_ok
-    {
+    } else if wrote_any && matches!(last_action, "command") && !last_verified_ok {
         format!(
-            "\nBuild failed. Use think to reason about the root cause, then use replace_lines \
+            "\nBuild failed. Find the root cause, then use edit \
              to fix the specific error. Re-run the build after fixing. \
              ({remaining} turns remaining)"
         )
-    } else if wrote_any && !matches!(last_action, "command" | "run_command" | "run_command_line") {
+    } else if matches!(last_action, "command") && !last_verified_ok {
+        format!(
+            "\nThe last command failed. Use its result to choose a different command, queue setup, or edit before retrying. \
+             Do not repeat the same command unchanged. ({remaining} turns remaining)"
+        )
+    } else if latest_command_failed {
+        format!(
+            "\nYou have fresh command failure evidence. Act on it: inspect, edit, queue setup, or choose a different command. \
+             Do not ignore it and drift back to blind retries. ({remaining} turns remaining)"
+        )
+    } else if wrote_any && !matches!(last_action, "command") {
         format!(
             "\nFiles written. Run the build now to verify your changes work before calling done. \
-             ({remaining} turns remaining)"
-        )
-    } else if last_action == "think" && last_action_ok {
-        format!(
-            "\nThought recorded. Your NEXT action MUST NOT be think — \
-             call read_file, write_file, replace_lines, command, or done now. \
              ({remaining} turns remaining)"
         )
     } else {
@@ -3767,20 +3635,11 @@ fn action_to_compact_json(action: &AgentAction) -> String {
     if let Some(q) = &action.query {
         map.insert("query".into(), serde_json::json!(q));
     }
-    if let Some(command_action) = &action.command_action {
-        map.insert("command_action".into(), serde_json::json!(command_action));
-    }
-    if let Some(cmd) = &action.cmd {
-        map.insert("cmd".into(), serde_json::json!(cmd));
-    }
     if let Some(command_line) = &action.command_line {
         map.insert("command_line".into(), serde_json::json!(command_line));
     }
-    if let Some(service_name) = &action.service_name {
-        map.insert("service_name".into(), serde_json::json!(service_name));
-    }
-    if !action.args.is_empty() {
-        map.insert("args".into(), serde_json::json!(action.args));
+    if let Some(cwd) = &action.cwd {
+        map.insert("cwd".into(), serde_json::json!(cwd));
     }
     if let Some(q) = &action.question {
         map.insert("question".into(), serde_json::json!(q));
@@ -3793,6 +3652,12 @@ fn action_to_compact_json(action: &AgentAction) -> String {
     }
     if let Some(d) = &action.description {
         map.insert("description".into(), serde_json::json!(d));
+    }
+    if !action.setup_commands.is_empty() {
+        map.insert(
+            "setup_commands".into(),
+            serde_json::json!(action.setup_commands),
+        );
     }
     serde_json::Value::Object(map).to_string()
 }
@@ -3868,8 +3733,7 @@ fn compress_for_cold_storage(content: &str, tool: &str) -> String {
                 lines.len() - 5
             )
         }
-        "command" | "run_command" | "run_command_line" | "start_service" | "status_service"
-        | "stop_service" => {
+        "command" => {
             if content.len() <= 120 {
                 return content.to_string();
             }
@@ -3932,7 +3796,7 @@ fn find_likely_unloaded(
 
 // ── render_file_numbered ──────────────────────────────────────────────────────
 //
-// Render a loaded file with REAL line numbers (so `replace_lines` can address it).
+// Render a loaded file with REAL line numbers (so `edit` can address them).
 // The numbers MUST be the file's true line numbers — small files render whole;
 // large files show real-numbered windows (head + keyword regions + tail) with
 // explicit "lines X-Y omitted" markers, never a renumbered reassembly.
@@ -3940,7 +3804,7 @@ fn find_likely_unloaded(
 /// Show files up to this many lines in full; window beyond it (head + keyword
 /// regions + tail, with REAL line numbers). Generous — small models comprehend a
 /// whole moderate file better than a stitched window, and a cold call on a few-K
-/// prompt is only ~15s on a local GPU. `replace_lines` addresses by real number.
+/// prompt is only ~15s on a local GPU. `edit` addresses by real line number.
 const FULL_RENDER_MAX_LINES: usize = 400;
 
 fn render_file_numbered(contents: &str, keywords: &[&str]) -> String {
@@ -4002,85 +3866,17 @@ fn render_file_numbered(contents: &str, keywords: &[&str]) -> String {
 
 fn action_summary(action: &AgentAction) -> String {
     match action.tool.as_str() {
-        "replace_lines" => format!(
+        "edit" if action.start_line.is_some() => format!(
             "{}:{}-{}",
             action.path.as_deref().unwrap_or("?"),
             action.start_line.unwrap_or(0),
             action.end_line.unwrap_or(0),
         ),
-        "apply_patch" => format!(
-            "{} ({} lines)",
-            action.path.as_deref().unwrap_or("?"),
-            action.patch.as_deref().unwrap_or("").lines().count()
-        ),
-        "str_replace" => action.path.as_deref().unwrap_or("?").to_string(),
-        "write_file" | "delete_file" | "read_file" => {
-            action.path.as_deref().unwrap_or("?").to_string()
-        }
-        "think" => {
-            let q = action.query.as_deref().unwrap_or("?");
-            let truncated: String = q.chars().take(60).collect();
-            if q.chars().count() > 60 {
-                format!("{truncated}…")
-            } else {
-                truncated
-            }
-        }
+        "edit" | "read_file" => action.path.as_deref().unwrap_or("?").to_string(),
         "search_files" => action.query.as_deref().unwrap_or("?").to_string(),
-        "command" => command_action_summary(action),
-        "run_command_line" => action.command_line.as_deref().unwrap_or("?").to_string(),
-        "install_dependencies" => action.path.as_deref().unwrap_or(".").to_string(),
-        "start_service" => format!(
-            "{}: {}",
-            action.service_name.as_deref().unwrap_or("?"),
-            action.command_line.as_deref().unwrap_or("?")
-        ),
-        "status_service" | "stop_service" => {
-            action.service_name.as_deref().unwrap_or("?").to_string()
-        }
-        "run_command" => {
-            // Show "cmd args[0]" as the summary
-            let cmd = action
-                .cmd
-                .as_deref()
-                .filter(|s| !s.is_empty())
-                .unwrap_or_else(|| action.args.first().map(|s| s.as_str()).unwrap_or("?"));
-            let first_arg = action.args.first().map(|s| s.as_str()).unwrap_or("");
-            if first_arg.is_empty() || action.cmd.as_deref().unwrap_or("").is_empty() {
-                cmd.to_string()
-            } else {
-                format!("{cmd} {first_arg}")
-            }
-        }
+        "command" => action.command_line.as_deref().unwrap_or("?").to_string(),
         "ask_user" => action.question.as_deref().unwrap_or("?").to_string(),
-        "sub_agent" => action.task.as_deref().unwrap_or("?").to_string(),
         "done" => action.description.as_deref().unwrap_or("done").to_string(),
-        other => other.to_string(),
-    }
-}
-
-fn command_action_summary(action: &AgentAction) -> String {
-    match action.command_action.as_deref().unwrap_or("") {
-        "run" => action
-            .command_line
-            .as_deref()
-            .map(str::to_string)
-            .unwrap_or_else(|| {
-                let cmd = action.cmd.as_deref().unwrap_or("?");
-                if action.args.is_empty() {
-                    cmd.to_string()
-                } else {
-                    format!("{} {}", cmd, action.args.join(" "))
-                }
-            }),
-        "install_dependencies" => format!("install {}", action.path.as_deref().unwrap_or(".")),
-        "start_service" => format!(
-            "start {}: {}",
-            action.service_name.as_deref().unwrap_or("?"),
-            action.command_line.as_deref().unwrap_or("?")
-        ),
-        "status_service" => format!("status {}", action.service_name.as_deref().unwrap_or("?")),
-        "stop_service" => format!("stop {}", action.service_name.as_deref().unwrap_or("?")),
         other => other.to_string(),
     }
 }
@@ -4129,6 +3925,160 @@ mod tests {
         }
     }
 
+    fn blank_action(tool: &str) -> AgentAction {
+        AgentAction {
+            tool: tool.into(),
+            path: None,
+            start_line: None,
+            end_line: None,
+            content: None,
+            query: None,
+            command_line: None,
+            cwd: None,
+            question: None,
+            context: None,
+            task: None,
+            description: None,
+            setup_commands: vec![],
+            criteria: vec![],
+        }
+    }
+
+    #[test]
+    fn edit_strategy_selects_by_capability() {
+        assert_eq!(
+            EditStrategy::for_capabilities(ToolChoiceMode::RequiredString),
+            EditStrategy::SingleShot
+        );
+        assert_eq!(
+            EditStrategy::for_capabilities(ToolChoiceMode::NamedObject),
+            EditStrategy::SingleShot
+        );
+        assert_eq!(
+            EditStrategy::for_capabilities(ToolChoiceMode::JsonSchema),
+            EditStrategy::SingleShot
+        );
+        assert!(EditStrategy::SingleShot.content_in_schema());
+    }
+
+    #[test]
+    fn agent_schema_always_carries_content_field() {
+        assert!(
+            agent_schema(0, true, false)["properties"]
+                .get("content")
+                .is_some()
+        );
+        assert!(
+            agent_schema(0, false, false)["properties"]
+                .get("content")
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn single_shot_edit_applies_inline_content_without_a_text_call() {
+        let tmp = tempfile::tempdir().unwrap();
+        // DummyProvider defaults to RequiredString → SingleShot, and panics if
+        // generate_text is ever called — proving the content came from the action.
+        let provider = DummyProvider;
+        let mut session = AgentSession::new(&provider, tmp.path().to_str().unwrap());
+        assert_eq!(session.edit_strategy, EditStrategy::SingleShot);
+        session.current_task = "edit".into();
+        session.file_state.insert("f.rs".into(), "a\nb\nc\n".into());
+
+        // `edit` with start_line routes to the line-range editor.
+        let mut action = blank_action("edit");
+        action.path = Some("f.rs".into());
+        action.start_line = Some(2);
+        action.end_line = Some(2);
+        action.content = Some("B".into());
+        match session.dispatch(action) {
+            Dispatch::Continue { ok, result } => assert!(ok, "{result}"),
+            _ => panic!("expected Continue"),
+        }
+        assert_eq!(session.file_state["f.rs"], "a\nB\nc\n");
+    }
+
+    #[test]
+    fn edit_without_start_line_creates_a_new_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let provider = DummyProvider; // SingleShot → uses inline content, no text call
+        let mut session = AgentSession::new(&provider, tmp.path().to_str().unwrap());
+        session.current_task = "create".into();
+
+        let mut action = blank_action("edit");
+        action.path = Some("new.rs".into());
+        action.content = Some("fn x() {}\n".into());
+        match session.dispatch(action) {
+            Dispatch::Continue { ok, result } => assert!(ok, "{result}"),
+            _ => panic!("expected Continue"),
+        }
+        assert_eq!(session.file_state["new.rs"], "fn x() {}\n");
+        assert!(tmp.path().join("new.rs").exists());
+    }
+
+    struct StubKnowledge;
+    impl KnowledgeLookup for StubKnowledge {
+        fn lookup(&self, query: &str) -> Result<String, String> {
+            Ok(format!("evidence for {query}"))
+        }
+    }
+
+    #[test]
+    fn knowledge_tool_dispatches_to_backend() {
+        let tmp = tempfile::tempdir().unwrap();
+        let provider = DummyProvider;
+        let mut session = AgentSession::new(&provider, tmp.path().to_str().unwrap())
+            .with_knowledge(Arc::new(StubKnowledge));
+        assert!(session.knowledge.is_some());
+
+        let mut action = blank_action("knowledge");
+        action.query = Some("axum routing".into());
+        match session.dispatch(action) {
+            Dispatch::Continue { ok, result } => {
+                assert!(ok, "{result}");
+                assert_eq!(result, "evidence for axum routing");
+            }
+            _ => panic!("expected Continue"),
+        }
+    }
+
+    #[test]
+    fn knowledge_tool_errors_without_backend() {
+        let tmp = tempfile::tempdir().unwrap();
+        let provider = DummyProvider;
+        let mut session = AgentSession::new(&provider, tmp.path().to_str().unwrap());
+        let mut action = blank_action("knowledge");
+        action.query = Some("anything".into());
+        match session.dispatch(action) {
+            Dispatch::Continue { ok, result } => {
+                assert!(!ok);
+                assert!(result.contains("no knowledge backend"), "{result}");
+            }
+            _ => panic!("expected Continue"),
+        }
+    }
+
+    #[test]
+    fn edit_without_inline_content_deletes_range() {
+        let tmp = tempfile::tempdir().unwrap();
+        let provider = DummyProvider;
+        let mut session = AgentSession::new(&provider, tmp.path().to_str().unwrap());
+        assert_eq!(session.edit_strategy, EditStrategy::SingleShot);
+        session.current_task = "edit".into();
+        session.file_state.insert("f.rs".into(), "a\nb\nc\n".into());
+
+        let mut action = blank_action("edit");
+        action.path = Some("f.rs".into());
+        action.start_line = Some(2);
+        action.end_line = Some(2);
+        match session.dispatch(action) {
+            Dispatch::Continue { ok, result } => assert!(ok, "{result}"),
+            _ => panic!("expected Continue"),
+        }
+        assert_eq!(session.file_state["f.rs"], "a\nc\n");
+    }
+
     #[test]
     fn action_envelope_accepts_direct_action() {
         let action: AgentActionEnvelope = serde_json::from_value(serde_json::json!({
@@ -4170,47 +4120,12 @@ mod tests {
     fn action_envelope_accepts_command_line_action() {
         let action: AgentActionEnvelope = serde_json::from_value(serde_json::json!({
             "tool": "command",
-            "command_action": "run",
-            "command_line": "cargo check"
+            "command_line": "program arg"
         }))
         .unwrap();
         let action = action.into_action();
         assert_eq!(action.tool, "command");
-        assert_eq!(action.command_action.as_deref(), Some("run"));
-        assert_eq!(action.command_line.as_deref(), Some("cargo check"));
-    }
-
-    #[test]
-    fn action_envelope_accepts_service_action() {
-        let action: AgentActionEnvelope = serde_json::from_value(serde_json::json!({
-            "tool": "command",
-            "command_action": "start_service",
-            "service_name": "api",
-            "command_line": "python3 app.py"
-        }))
-        .unwrap();
-        let action = action.into_action();
-        assert_eq!(action.tool, "command");
-        assert_eq!(action.command_action.as_deref(), Some("start_service"));
-        assert_eq!(action.service_name.as_deref(), Some("api"));
-        assert_eq!(action.command_line.as_deref(), Some("python3 app.py"));
-    }
-
-    #[test]
-    fn action_envelope_accepts_install_dependencies_action() {
-        let action: AgentActionEnvelope = serde_json::from_value(serde_json::json!({
-            "tool": "command",
-            "command_action": "install_dependencies",
-            "path": "."
-        }))
-        .unwrap();
-        let action = action.into_action();
-        assert_eq!(action.tool, "command");
-        assert_eq!(
-            action.command_action.as_deref(),
-            Some("install_dependencies")
-        );
-        assert_eq!(action.path.as_deref(), Some("."));
+        assert_eq!(action.command_line.as_deref(), Some("program arg"));
     }
 
     #[test]
@@ -4226,12 +4141,107 @@ mod tests {
     }
 
     #[test]
-    fn run_command_line_still_uses_safety_policy() {
+    fn run_command_rejects_shell_operators() {
+        let argv = split_command_line("first --version && second --version").unwrap();
+        let err = validate_direct_argv(&argv[0], &argv[1..]).unwrap_err();
+        assert!(err.contains("unsupported_shell_operator"), "{err}");
+        assert!(err.contains("first"), "{err}");
+        assert!(err.contains("second"), "{err}");
+    }
+
+    #[test]
+    fn command_spec_parses_command_line_into_program_and_args() {
+        let mut action = blank_action("command");
+        action.command_line = Some("npm run build".into());
+        let command = command_spec(&action).ok().expect("expected command");
+        assert_eq!(command.program, "npm");
+        assert_eq!(command.args, vec!["run", "build"]);
+    }
+
+    #[test]
+    fn command_spec_requires_command_line() {
+        let action = blank_action("command");
+        match command_spec(&action) {
+            Err(Dispatch::Continue { ok, result }) => {
+                assert!(!ok);
+                assert!(result.contains("command_line"), "{result}");
+            }
+            _ => panic!("expected Continue dispatch error"),
+        }
+    }
+
+    #[test]
+    fn shell_operator_recovery_maps_cd_to_cwd() {
+        // `cd frontend && npm install` should recover as `npm install` with cwd="frontend",
+        // not emit a useless `cd` subprocess followed by `npm install` at workspace root.
+        let argv: Vec<String> = ["cd", "frontend", "&&", "npm", "install"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let recovered = split_shell_operator_recovery(&argv);
+        assert_eq!(recovered.len(), 1, "{recovered:?}");
+        assert_eq!(recovered[0].program, "npm");
+        assert_eq!(recovered[0].args, vec!["install"]);
+        assert_eq!(recovered[0].cwd.as_deref(), Some("frontend"));
+    }
+
+    #[test]
+    fn run_command_rejects_bare_interactive_programs() {
+        let err = validate_direct_argv("node", &[]).unwrap_err();
+        assert!(err.contains("without args"), "{err}");
+        assert!(validate_direct_argv("node", &["-v".into()]).is_ok());
+        assert!(validate_direct_argv("npm", &["create".into(), "vite@latest".into()]).is_ok());
+    }
+
+    #[test]
+    fn run_command_rejects_long_running_dev_server_commands() {
         let tmp = tempfile::tempdir().unwrap();
         let result = execute_command(
             tmp.path().to_str().unwrap(),
+            None,
+            "npm",
+            &["run".into(), "dev".into(), "--prefix".into(), "web".into()],
+            &[],
+        );
+        let Dispatch::Continue { ok, result } = result else {
+            panic!("expected continue dispatch");
+        };
+        assert!(!ok);
+        assert!(
+            result.contains("long_running_command_not_supported"),
+            "{result}"
+        );
+    }
+
+    #[test]
+    fn run_executes_command_line() {
+        let tmp = tempfile::tempdir().unwrap();
+        let provider = DummyProvider;
+        let mut session = AgentSession::new(&provider, tmp.path().to_str().unwrap());
+        let action: AgentActionEnvelope = serde_json::from_value(serde_json::json!({
+            "tool": "command",
+            "command_line": "python3 -c \"print('one')\""
+        }))
+        .unwrap();
+
+        match session.dispatch(action.into_action()) {
+            Dispatch::Continue { ok, result } => {
+                assert!(ok, "{result}");
+                assert!(result.contains("one"), "{result}");
+            }
+            _ => panic!("expected command run result"),
+        }
+    }
+
+    #[test]
+    fn command_still_uses_safety_policy() {
+        let tmp = tempfile::tempdir().unwrap();
+        let result = execute_command(
+            tmp.path().to_str().unwrap(),
+            None,
             "sh",
             &["-c".into(), "echo unsafe".into()],
+            &[],
         );
         match result {
             Dispatch::Continue { ok, result } => {
@@ -4261,6 +4271,7 @@ mod tests {
                 "-c".into(),
                 "from pathlib import Path; assert Path('value.txt').read_text() == 'new'".into(),
             ],
+            None,
         );
 
         match result {
@@ -4270,32 +4281,105 @@ mod tests {
     }
 
     #[test]
-    fn command_runs_queued_setup_before_verification() {
+    fn discover_project_roots_is_driven_by_changed_files_not_a_full_scan() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join("frontend")).unwrap();
+        std::fs::write(tmp.path().join("frontend/package.json"), "{}").unwrap();
+        // A manifest that exists on disk but is unrelated to any changed file must
+        // not surface — discovery follows the changed paths' directory chain, it
+        // does not walk the whole tree.
+        std::fs::create_dir_all(tmp.path().join("unrelated")).unwrap();
+        std::fs::write(tmp.path().join("unrelated/Cargo.toml"), "").unwrap();
+
+        let changed = vec!["frontend/src/App.tsx".to_string()];
+        let found = discover_project_roots(tmp.path(), &changed);
+
+        assert!(
+            found
+                .iter()
+                .any(|(dir, name)| dir == "frontend" && name == "package.json"),
+            "{found:?}"
+        );
+        assert!(
+            !found.iter().any(|(dir, _)| dir == "unrelated"),
+            "unrelated manifest should not be discovered: {found:?}"
+        );
+    }
+
+    #[test]
+    fn nonzero_exit_hints_known_project_dir_when_cwd_missing() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join("frontend")).unwrap();
+        std::fs::write(tmp.path().join("frontend/package.json"), "{}").unwrap();
+
+        let result = execute_command(
+            tmp.path().to_str().unwrap(),
+            None,
+            "false",
+            &[],
+            &["frontend".to_string()],
+        );
+        match result {
+            Dispatch::Continue { ok, result } => {
+                assert!(!ok);
+                assert!(result.contains("frontend"), "{result}");
+                assert!(result.contains("cwd"), "{result}");
+            }
+            _ => panic!("expected command result"),
+        }
+    }
+
+    #[test]
+    fn cwd_hint_is_silent_when_cwd_already_set_or_no_projects_known() {
+        assert_eq!(cwd_hint(Some("frontend"), &["frontend".to_string()]), "");
+        assert_eq!(cwd_hint(None, &[]), "");
+    }
+
+    #[test]
+    fn command_expectation_requires_expected_paths() {
         let tmp = tempfile::tempdir().unwrap();
         let provider = DummyProvider;
-        let mut session = AgentSession::new(&provider, tmp.path().to_str().unwrap());
-        session.queued_setup_commands.push(ProposedCommand {
+        let session = AgentSession::new(&provider, tmp.path().to_str().unwrap());
+        let command = ProposedCommand {
             program: "python3".into(),
             args: vec![
                 "-c".into(),
-                "from pathlib import Path; Path('setup.txt').write_text('ready')".into(),
+                "from pathlib import Path; Path('package.json').write_text('{}')".into(),
             ],
-        });
+            cwd: None,
+            expect_workspace_change: true,
+            expect_paths: vec!["package.json".into()],
+        };
 
-        let result = session.execute_deduped_command(
-            "check:setup".into(),
-            "python3",
-            &[
-                "-c".into(),
-                "from pathlib import Path; assert Path('setup.txt').read_text() == 'ready'".into(),
-            ],
-        );
-
-        match result {
-            Dispatch::Continue { ok, result } => assert!(ok, "{result}"),
+        match session.execute_command_with_expectations(&command) {
+            Dispatch::Continue { ok, result } => {
+                assert!(ok, "{result}");
+                assert!(tmp.path().join("package.json").exists());
+            }
             _ => panic!("expected command result"),
         }
-        assert!(session.queued_setup_commands.is_empty());
+    }
+
+    #[test]
+    fn command_expectation_detects_missing_effect() {
+        let tmp = tempfile::tempdir().unwrap();
+        let provider = DummyProvider;
+        let session = AgentSession::new(&provider, tmp.path().to_str().unwrap());
+        let command = ProposedCommand {
+            program: "python3".into(),
+            args: vec!["-c".into(), "print('no change')".into()],
+            cwd: None,
+            expect_workspace_change: true,
+            expect_paths: vec!["package.json".into()],
+        };
+
+        match session.execute_command_with_expectations(&command) {
+            Dispatch::Continue { ok, result } => {
+                assert!(!ok);
+                assert!(result.contains("expected_paths_missing"), "{result}");
+            }
+            _ => panic!("expected command result"),
+        }
     }
 
     #[test]
@@ -4306,81 +4390,80 @@ mod tests {
     }
 
     #[test]
-    fn think_is_rejected_after_successful_edit() {
-        let tmp = tempfile::tempdir().unwrap();
-        let provider = DummyProvider;
-        let mut session = AgentSession::new(&provider, tmp.path().to_str().unwrap());
-        session.turns.push(AgentTurn {
-            tool: "replace_lines".into(),
-            result: "OK".into(),
-            ok: true,
-        });
-
-        let result = session.dispatch(AgentAction {
-            tool: "think".into(),
-            path: None,
-            start_line: None,
-            end_line: None,
-            patch: None,
-            old_str: None,
-            new_str: None,
-            query: Some("what next".into()),
-            command_action: None,
-            cmd: None,
-            command_line: None,
-            service_name: None,
-            args: vec![],
-            question: None,
-            context: None,
-            task: None,
-            description: None,
-            setup_commands: vec![],
-        });
-
-        match result {
-            Dispatch::Continue { ok, result } => {
-                assert!(!ok);
-                assert!(result.contains("Do not think again"), "{result}");
-            }
-            _ => panic!("expected rejected think result"),
-        }
-    }
-
-    #[test]
-    fn think_is_removed_from_schema_after_first_successful_think() {
-        let tmp = tempfile::tempdir().unwrap();
-        let provider = DummyProvider;
-        let mut session = AgentSession::new(&provider, tmp.path().to_str().unwrap());
-        assert!(session.allow_think());
-        session.turns.push(AgentTurn {
-            tool: "think".into(),
-            result: "plan".into(),
-            ok: true,
-        });
-        assert!(!session.allow_think());
-
-        let schema = agent_schema(0, session.allow_think(), session.allow_search());
+    fn search_stays_available_after_edit() {
+        // Recovery is no longer blocked: search/re-read remain after an edit lands.
+        let schema = agent_schema(0, true, false);
         let tools = schema["properties"]["tool"]["enum"].as_array().unwrap();
-        assert!(!tools.iter().any(|tool| tool == "think"));
-        assert!(tools.iter().any(|tool| tool == "command"));
-    }
-
-    #[test]
-    fn search_and_query_are_removed_from_schema_after_edit() {
-        let tmp = tempfile::tempdir().unwrap();
-        let provider = DummyProvider;
-        let mut session = AgentSession::new(&provider, tmp.path().to_str().unwrap());
-        session.turns.push(AgentTurn {
-            tool: "replace_lines".into(),
-            result: "OK".into(),
-            ok: true,
-        });
-
-        let schema = agent_schema(0, session.allow_think(), session.allow_search());
-        let tools = schema["properties"]["tool"]["enum"].as_array().unwrap();
-        assert!(!tools.iter().any(|tool| tool == "search_files"));
-        assert!(schema["properties"].get("query").is_none());
+        assert!(tools.iter().any(|tool| tool == "search_files"));
+        assert!(schema["properties"].get("query").is_some());
         assert_eq!(schema["additionalProperties"], false);
+    }
+
+    #[test]
+    fn knowledge_tool_only_present_when_backend_wired() {
+        let without = agent_schema(0, true, false);
+        let with = agent_schema(0, true, true);
+        assert!(
+            !without["properties"]["tool"]["enum"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|t| t == "knowledge")
+        );
+        assert!(
+            with["properties"]["tool"]["enum"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|t| t == "knowledge")
+        );
+        assert!(tools_doc(false, true).contains("knowledge"));
+        assert!(!tools_doc(false, false).contains("• knowledge"));
+    }
+
+    #[test]
+    fn collapsed_tool_set_excludes_removed_tools() {
+        let schema = agent_schema(0, true, false);
+        let tools = schema["properties"]["tool"]["enum"].as_array().unwrap();
+        for removed in ["think", "delete_file", "sub_agent"] {
+            assert!(
+                !tools.iter().any(|t| t == removed),
+                "{removed} should be gone"
+            );
+        }
+        for kept in ["read_file", "search_files", "edit", "command", "done"] {
+            assert!(tools.iter().any(|t| t == kept), "{kept} should be present");
+        }
+        // write_file/replace_lines were replaced by the single `edit` tool.
+        for folded in ["write_file", "replace_lines"] {
+            assert!(
+                !tools.iter().any(|t| t == folded),
+                "{folded} should be folded into edit"
+            );
+        }
+        // ask_user is depth-0 only.
+        assert!(tools.iter().any(|t| t == "ask_user"));
+        assert!(
+            !agent_schema(1, true, false)["properties"]["tool"]["enum"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|t| t == "ask_user")
+        );
+    }
+
+    #[test]
+    fn tools_doc_lists_each_enabled_tool() {
+        let doc = tools_doc(false, false);
+        for name in ["read_file", "search_files", "• edit", "command", "done"] {
+            assert!(doc.contains(name), "doc should mention {name}");
+        }
+        assert!(!doc.contains("• think"));
+        assert!(!doc.contains("sub_agent"));
+        // Verifier doc excludes the edit tool.
+        let vdoc = tools_doc(true, false);
+        assert!(!vdoc.contains("• edit"));
+        assert!(vdoc.contains("read_file"));
     }
 
     #[test]
@@ -4398,7 +4481,7 @@ mod tests {
             contents: "export const status = 'locked';\n".into(),
         });
         session.turns.push(AgentTurn {
-            tool: "replace_lines".into(),
+            tool: "edit".into(),
             result: "OK".into(),
             ok: true,
         });
@@ -4429,13 +4512,13 @@ mod tests {
         ];
         let turns = vec![
             AgentTurn {
-                tool: "replace_lines".into(),
+                tool: "edit".into(),
                 result: "OK".into(),
                 ok: true,
             },
             AgentTurn {
-                tool: "run_command_line".into(),
-                result: "cargo check passed".into(),
+                tool: "command".into(),
+                result: "program arg passed".into(),
                 ok: true,
             },
         ];
@@ -4445,126 +4528,13 @@ mod tests {
             &file_state,
             &ops,
             &turns,
+            None,
+            8,
             &SessionBudget::for_model(8192),
         );
 
         assert!(nudge.contains("README.md"), "{nudge}");
         assert!(!nudge.contains("Build passed"), "{nudge}");
-    }
-
-    #[test]
-    fn service_lifecycle_starts_reports_and_stops_process() {
-        let tmp = tempfile::tempdir().unwrap();
-        let provider = DummyProvider;
-        let mut session = AgentSession::new(&provider, tmp.path().to_str().unwrap());
-
-        match session.start_service("worker", "sleep 5") {
-            Dispatch::Continue { ok, result } => {
-                assert!(ok, "{result}");
-                assert!(result.contains("Service 'worker' started"), "{result}");
-            }
-            _ => panic!("expected service start result"),
-        }
-        assert!(session.services.contains_key("worker"));
-
-        match session.status_service("worker") {
-            Dispatch::Continue { ok, result } => {
-                assert!(ok, "{result}");
-                assert!(result.contains("running"), "{result}");
-            }
-            _ => panic!("expected service status result"),
-        }
-
-        match session.stop_service("worker") {
-            Dispatch::Continue { ok, result } => {
-                assert!(ok, "{result}");
-                assert!(result.contains("Service 'worker'"), "{result}");
-            }
-            _ => panic!("expected service stop result"),
-        }
-        assert!(!session.services.contains_key("worker"));
-    }
-
-    #[test]
-    fn start_service_still_uses_safety_policy() {
-        let tmp = tempfile::tempdir().unwrap();
-        let provider = DummyProvider;
-        let mut session = AgentSession::new(&provider, tmp.path().to_str().unwrap());
-
-        match session.start_service("bad", "sh -c 'sleep 1'") {
-            Dispatch::Continue { ok, result } => {
-                assert!(!ok);
-                assert!(result.contains("requires approval"), "{result}");
-            }
-            _ => panic!("expected service start result"),
-        }
-        assert!(session.services.is_empty());
-    }
-
-    #[test]
-    fn install_dependencies_queues_pnpm_install_from_lockfile() {
-        let tmp = tempfile::tempdir().unwrap();
-        std::fs::write(tmp.path().join("package.json"), "{}\n").unwrap();
-        std::fs::write(
-            tmp.path().join("pnpm-lock.yaml"),
-            "lockfileVersion: '9.0'\n",
-        )
-        .unwrap();
-        let provider = DummyProvider;
-        let mut session = AgentSession::new(&provider, tmp.path().to_str().unwrap());
-
-        match session.queue_install_dependencies(None) {
-            Dispatch::Continue { ok, result } => {
-                assert!(ok, "{result}");
-                assert!(result.contains("pnpm install"), "{result}");
-            }
-            _ => panic!("expected install queue result"),
-        }
-
-        assert_eq!(
-            session.queued_setup_commands,
-            vec![ProposedCommand {
-                program: "pnpm".into(),
-                args: vec!["install".into()],
-            }]
-        );
-    }
-
-    #[test]
-    fn install_dependencies_deduplicates_identical_command() {
-        let tmp = tempfile::tempdir().unwrap();
-        std::fs::write(tmp.path().join("requirements.txt"), "requests\n").unwrap();
-        let provider = DummyProvider;
-        let mut session = AgentSession::new(&provider, tmp.path().to_str().unwrap());
-
-        let _ = session.queue_install_dependencies(None);
-        let second = session.queue_install_dependencies(Some("requirements.txt"));
-        match second {
-            Dispatch::Continue { ok, result } => {
-                assert!(ok, "{result}");
-                assert!(result.contains("already queued"), "{result}");
-            }
-            _ => panic!("expected install queue result"),
-        }
-        assert_eq!(session.queued_setup_commands.len(), 1);
-    }
-
-    #[test]
-    fn install_dependencies_rejects_subdirectory_for_now() {
-        let tmp = tempfile::tempdir().unwrap();
-        std::fs::create_dir_all(tmp.path().join("packages/web")).unwrap();
-        std::fs::write(tmp.path().join("packages/web/package.json"), "{}\n").unwrap();
-        let provider = DummyProvider;
-        let mut session = AgentSession::new(&provider, tmp.path().to_str().unwrap());
-
-        match session.queue_install_dependencies(Some("packages/web")) {
-            Dispatch::Continue { ok, result } => {
-                assert!(!ok);
-                assert!(result.contains("workspace root"), "{result}");
-            }
-            _ => panic!("expected install queue result"),
-        }
-        assert!(session.queued_setup_commands.is_empty());
     }
 
     #[test]
@@ -4574,11 +4544,31 @@ mod tests {
             &HashMap::new(),
             &[],
             &[],
+            None,
+            12,
             "/tmp/example-workspace",
             &SessionBudget::default(),
         );
         assert!(msg.contains("ENVIRONMENT:"));
         assert!(msg.contains("workspace_root: /tmp/example-workspace"));
+    }
+
+    #[test]
+    fn continuation_includes_latest_command_result() {
+        let msg = build_continuation_msg(
+            "inspect the project",
+            &HashMap::new(),
+            &[],
+            &[],
+            Some(&CommandObservation {
+                summary: "npm install failed [nonzero_exit]: package.json missing".into(),
+            }),
+            12,
+            "/tmp/example-workspace",
+            &SessionBudget::default(),
+        );
+        assert!(msg.contains("LATEST COMMAND RESULT:"), "{msg}");
+        assert!(msg.contains("npm install failed"), "{msg}");
     }
 
     #[test]
@@ -4605,17 +4595,19 @@ mod tests {
 
         assert_eq!(session.effective_max_turns(), 12);
         session.turns.push(AgentTurn {
-            tool: "replace_lines".into(),
+            tool: "edit".into(),
             result: "ok".into(),
             ok: true,
         });
-        assert_eq!(session.effective_max_turns(), 12);
+        session.last_progress_turn = session.turns.len();
+        assert_eq!(session.effective_max_turns(), 13);
         session.turns.push(AgentTurn {
-            tool: "run_command_line".into(),
+            tool: "command".into(),
             result: "Error: failing test".into(),
             ok: false,
         });
-        assert_eq!(session.effective_max_turns(), 12 + REPAIR_TURN_EXTENSION);
+        session.last_progress_turn = session.turns.len();
+        assert_eq!(session.effective_max_turns(), 14 + REPAIR_TURN_EXTENSION);
     }
 
     #[test]
@@ -4660,43 +4652,22 @@ mod tests {
     }
 
     #[test]
-    fn apply_str_replace_ok() {
-        let mut state: HashMap<String, String> = HashMap::new();
-        state.insert("f.txt".into(), "hello world\n".into());
-        let r = apply_str_replace(&mut state, "f.txt", "hello", "hi");
-        assert_eq!(r, "OK");
-        assert_eq!(state["f.txt"], "hi world\n");
-    }
+    fn search_files_falls_back_to_listing_when_query_has_no_matches() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join("src")).unwrap();
+        std::fs::write(tmp.path().join("src/main.rs"), "fn main() {}\n").unwrap();
 
-    #[test]
-    fn apply_str_replace_not_found() {
-        let mut state: HashMap<String, String> = HashMap::new();
-        state.insert("f.txt".into(), "hello\n".into());
-        let r = apply_str_replace(&mut state, "f.txt", "bye", "hi");
-        assert!(r.starts_with("Error: old_str not found"), "{r}");
-    }
+        let result = search_files_in_workspace(
+            tmp.path().to_str().unwrap(),
+            "List all files in the workspace to understand the project structure.",
+            &[],
+        );
 
-    #[test]
-    fn apply_str_replace_ambiguous() {
-        let mut state: HashMap<String, String> = HashMap::new();
-        state.insert("f.txt".into(), "x\nx\n".into());
-        let r = apply_str_replace(&mut state, "f.txt", "x", "y");
-        assert!(r.contains("2 times"), "{r}");
-    }
-
-    #[test]
-    fn apply_str_replace_missing_file() {
-        let mut state: HashMap<String, String> = HashMap::new();
-        let r = apply_str_replace(&mut state, "missing.txt", "a", "b");
-        assert!(r.starts_with("Error: file"), "{r}");
-    }
-
-    #[test]
-    fn apply_str_replace_noop() {
-        let mut state: HashMap<String, String> = HashMap::new();
-        state.insert("f.txt".into(), "hello\n".into());
-        let r = apply_str_replace(&mut state, "f.txt", "hello", "hello");
-        assert!(r.contains("identical"), "{r}");
+        assert!(
+            result.contains("Listing workspace files instead:"),
+            "{result}"
+        );
+        assert!(result.contains("src/main.rs"), "{result}");
     }
 
     // ── resolve_in_workspace security tests ──────────────────────────────────

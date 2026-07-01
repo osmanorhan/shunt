@@ -2,10 +2,12 @@ use std::time::Duration;
 
 use reqwest::blocking::Client;
 use serde::Deserialize;
-use shunt_core::Ambiguity;
+use shunt_core::{Ambiguity, ManualEvidence, ManualVersionStatus};
 
-pub(crate) trait AmbiguityResolver: Send + Sync {
-    fn resolve(&self, ambiguity: &Ambiguity) -> Option<String>;
+use crate::LookupResolution;
+
+pub(crate) trait LookupSource: Send + Sync {
+    fn resolve(&self, ambiguity: &Ambiguity) -> Option<LookupResolution>;
 }
 
 struct NpmRegistryResolver {
@@ -40,8 +42,8 @@ impl Default for CratesIoResolver {
     }
 }
 
-impl AmbiguityResolver for NpmRegistryResolver {
-    fn resolve(&self, ambiguity: &Ambiguity) -> Option<String> {
+impl LookupSource for NpmRegistryResolver {
+    fn resolve(&self, ambiguity: &Ambiguity) -> Option<LookupResolution> {
         let candidates = extract_npm_package_names(ambiguity);
         if candidates.is_empty() {
             return None;
@@ -52,16 +54,18 @@ impl AmbiguityResolver for NpmRegistryResolver {
                 results.push(format!("{pkg}@{version}"));
             }
         }
-        if results.is_empty() {
-            None
-        } else {
-            Some(format!("Latest npm versions: {}", results.join(", ")))
-        }
+        build_lookup_resolution(
+            ambiguity,
+            &candidates,
+            "registry-lookup",
+            "Latest npm versions",
+            results,
+        )
     }
 }
 
-impl AmbiguityResolver for CratesIoResolver {
-    fn resolve(&self, ambiguity: &Ambiguity) -> Option<String> {
+impl LookupSource for CratesIoResolver {
+    fn resolve(&self, ambiguity: &Ambiguity) -> Option<LookupResolution> {
         let candidates = extract_crate_names(ambiguity);
         if candidates.is_empty() {
             return None;
@@ -72,19 +76,55 @@ impl AmbiguityResolver for CratesIoResolver {
                 results.push(format!("{krate}@{version}"));
             }
         }
-        if results.is_empty() {
-            None
-        } else {
-            Some(format!("Latest crates.io versions: {}", results.join(", ")))
-        }
+        build_lookup_resolution(
+            ambiguity,
+            &candidates,
+            "registry-lookup",
+            "Latest crates.io versions",
+            results,
+        )
     }
 }
 
-pub(crate) fn default_ambiguity_resolvers() -> Vec<Box<dyn AmbiguityResolver>> {
+pub(crate) fn default_lookup_sources() -> Vec<Box<dyn LookupSource>> {
     vec![
         Box::new(NpmRegistryResolver::default()),
         Box::new(CratesIoResolver::default()),
     ]
+}
+
+fn build_lookup_resolution(
+    ambiguity: &Ambiguity,
+    candidates: &[String],
+    source: &str,
+    prefix: &str,
+    results: Vec<String>,
+) -> Option<LookupResolution> {
+    if results.is_empty() {
+        return None;
+    }
+
+    let resolution = format!("{prefix}: {}", results.join(", "));
+    let package = candidates
+        .first()
+        .cloned()
+        .unwrap_or_else(|| ambiguity.id.clone());
+    Some(LookupResolution {
+        ambiguity_id: ambiguity.id.clone(),
+        resolution: resolution.clone(),
+        evidence: ManualEvidence {
+            ecosystem: "registry".into(),
+            package,
+            version: None,
+            version_status: ManualVersionStatus::Unversioned,
+            source: source.into(),
+            locator: String::new(),
+            title: Some("Auto-resolved registry fact".into()),
+            excerpt: resolution,
+            relevance_reason: format!("resolved lookup ambiguity {}", ambiguity.id),
+            confidence: 0.95,
+        },
+    })
 }
 
 fn extract_npm_package_names(ambiguity: &Ambiguity) -> Vec<String> {

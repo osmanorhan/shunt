@@ -66,6 +66,12 @@ pub enum UserRequest {
         open: Vec<PendingAmbiguity>,
         confidence: f32,
     },
+    /// The coding agent paused via its `ask_user` tool.
+    AgentQuestion {
+        question_id: AmbiguityId,
+        question: String,
+        context: String,
+    },
     /// User must approve or reject the proposed plan before execution.
     Approval {
         candidate_count: usize,
@@ -101,6 +107,7 @@ impl TaskState {
             Self::Running => "running",
             Self::WaitingForUser { request } => match request {
                 UserRequest::Clarification { .. } => "waiting · answer needed",
+                UserRequest::AgentQuestion { .. } => "waiting · agent question",
                 UserRequest::Approval { .. } => "waiting · approval needed",
                 UserRequest::DangerousCommands { .. } => "waiting · dangerous commands",
             },
@@ -119,6 +126,7 @@ impl TaskState {
             Self::Running => None,
             Self::WaitingForUser { request } => match request {
                 UserRequest::Clarification { .. } => Some(TaskPhase::Clarify),
+                UserRequest::AgentQuestion { .. } => Some(TaskPhase::Execute),
                 UserRequest::Approval { .. } => Some(TaskPhase::Agree),
                 UserRequest::DangerousCommands { .. } => Some(TaskPhase::Execute),
             },
@@ -208,6 +216,7 @@ pub enum MachineEvent {
     ProposalReady {
         confidence: f32,
         op_count: usize,
+        command_count: usize,
         snapshot: ArtifactSnapshot,
     },
 
@@ -216,6 +225,7 @@ pub enum MachineEvent {
     AgentAsked {
         ambiguity_id: String,
         question: String,
+        context: String,
         options: Vec<String>,
     },
 
@@ -262,6 +272,11 @@ pub enum Effect {
     RecordAnswer {
         artifact_id: ArtifactId,
         ambiguity_id: AmbiguityId,
+        answer: String,
+    },
+    ResumeAgent {
+        artifact_id: ArtifactId,
+        question_id: AmbiguityId,
         answer: String,
     },
     ApplyArtifactPatch {

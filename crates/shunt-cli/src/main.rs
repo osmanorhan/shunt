@@ -4,10 +4,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use clap::{Parser, Subcommand, ValueEnum};
-use crossterm::event::{
-    self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind, KeyModifiers,
-    MouseEventKind,
-};
+use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
 use crossterm::execute;
 use crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
@@ -334,6 +331,22 @@ struct AppConfig {
     agent: SessionBudgetOverride,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+struct KnowledgeUiConfig {
+    external_fetch: bool,
+    #[serde(default)]
+    sources: Vec<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct ConfigView {
+    config_path: String,
+    knowledge_config_path: String,
+    app: AppConfig,
+    knowledge: KnowledgeUiConfig,
+}
+
 impl Default for AppConfig {
     fn default() -> Self {
         Self {
@@ -350,11 +363,29 @@ impl Default for AppConfig {
     }
 }
 
+impl Default for KnowledgeUiConfig {
+    fn default() -> Self {
+        Self {
+            external_fetch: true,
+            sources: vec![
+                "catalog".into(),
+                "registry_metadata".into(),
+                "deepwiki".into(),
+                "docs_rs".into(),
+                "repository_readme".into(),
+                "public_search".into(),
+            ],
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 struct AppContext {
     workspace_root: PathBuf,
     config_path: PathBuf,
+    knowledge_config_path: PathBuf,
     config: AppConfig,
+    knowledge_config: KnowledgeUiConfig,
 }
 
 impl AppContext {
@@ -390,6 +421,7 @@ impl AppContext {
             )));
         }
         write_default_config(&self.config_path)?;
+        write_default_knowledge_config(&self.knowledge_config_path)?;
         Ok(())
     }
 }
@@ -487,12 +519,10 @@ struct AgentLiveState {
     turn: usize,
     max_turns: usize,
     last_tool: String,
-    last_summary: String,
     files_read: Vec<String>,
     files_written: Vec<String>,
     pending_write: Option<String>,
     last_ok: bool,
-    last_detail: String,
 }
 
 /// Rendered form of the agent's current understanding, shown in the sidebar.
@@ -514,9 +544,14 @@ impl AgentApp {
             entries: vec![SessionEntry {
                 kind: SessionEntryKind::Frame,
                 body: format!(
-                    "Frame ready  model={}  endpoint={}",
+                    "Frame ready  model={}  endpoint={}  knowledge={}",
                     context.config.model.as_deref().unwrap_or("<unset>"),
-                    context.config.endpoint
+                    context.config.endpoint,
+                    if context.knowledge_config.external_fetch {
+                        "on"
+                    } else {
+                        "off"
+                    }
                 ),
             }],
             log_scroll_from_bottom: 0,
@@ -544,9 +579,18 @@ impl AgentApp {
     }
 
     fn push(&mut self, kind: SessionEntryKind, body: impl Into<String>) {
+        let body = body.into();
+        if self
+            .entries
+            .last()
+            .map(|entry| entry.kind == kind && entry.body == body)
+            .unwrap_or(false)
+        {
+            return;
+        }
         self.entries.push(SessionEntry {
             kind: kind.clone(),
-            body: body.into(),
+            body,
         });
         // Scroll to bottom for anything the user must not miss.
         // Progress entries during streaming don't scroll (user may be reading history).
@@ -580,7 +624,7 @@ impl TerminalSession {
     fn enter() -> Result<Self, CliError> {
         enable_raw_mode()?;
         let mut stdout = io::stdout();
-        execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
+        execute!(stdout, EnterAlternateScreen)?;
         let terminal = Terminal::new(CrosstermBackend::new(stdout)).map_err(CliError::Io)?;
         Ok(Self { terminal })
     }
@@ -593,11 +637,7 @@ impl TerminalSession {
 impl Drop for TerminalSession {
     fn drop(&mut self) {
         let _ = disable_raw_mode();
-        let _ = execute!(
-            self.terminal.backend_mut(),
-            LeaveAlternateScreen,
-            DisableMouseCapture
-        );
+        let _ = execute!(self.terminal.backend_mut(), LeaveAlternateScreen);
         let _ = self.terminal.show_cursor();
     }
 }
@@ -692,10 +732,12 @@ fn load_context(
     let config_path = config_override
         .map(|path| resolve_path(&workspace_root, &path))
         .unwrap_or_else(|| workspace_root.join(".shunt/config.toml"));
+    let knowledge_config_path = workspace_root.join(".shunt/knowledge.toml");
     let default_config_path = workspace_root.join(".shunt/config.toml");
 
     if auto_create_config && !has_explicit_config && !default_config_path.exists() {
         write_default_config(&default_config_path)?;
+        write_default_knowledge_config(&knowledge_config_path)?;
     }
 
     let config = if config_path.exists() {
@@ -703,11 +745,18 @@ fn load_context(
     } else {
         AppConfig::default()
     };
+    let knowledge_config = if knowledge_config_path.exists() {
+        toml::from_str(&std::fs::read_to_string(&knowledge_config_path)?)?
+    } else {
+        KnowledgeUiConfig::default()
+    };
 
     Ok(AppContext {
         workspace_root,
         config_path,
+        knowledge_config_path,
         config,
+        knowledge_config,
     })
 }
 
@@ -877,13 +926,8 @@ fn run_agent_session(
         if !event::poll(Duration::from_millis(100))? {
             continue;
         }
-        match event::read()? {
-            Event::Mouse(mouse) => match mouse.kind {
-                MouseEventKind::ScrollUp => app.scroll_log_up(3),
-                MouseEventKind::ScrollDown => app.scroll_log_down(3),
-                _ => {}
-            },
-            Event::Key(key) => {
+        if let Event::Key(key) = event::read()? {
+            {
                 if key.kind != KeyEventKind::Press {
                     continue;
                 }
@@ -1016,7 +1060,6 @@ fn run_agent_session(
                     _ => {}
                 }
             }
-            _ => {}
         }
     }
     Ok(())
@@ -1316,6 +1359,11 @@ fn drain_session(app: &mut AgentApp) {
                     // pending_question is populated by ClarificationNeeded notification.
                 }
                 TaskState::WaitingForUser {
+                    request: UserRequest::AgentQuestion { .. },
+                } => {
+                    // pending_question is populated by ClarificationNeeded notification.
+                }
+                TaskState::WaitingForUser {
                     request: UserRequest::Approval { .. },
                 } => {
                     app.pending_question = None;
@@ -1596,7 +1644,7 @@ fn apply_notification(app: &mut AgentApp, notif: Notification) {
             if tool == "read_file" && !files_read.contains(summary) {
                 files_read.push(summary.clone());
             }
-            let pending_write = if tool == "write_file" || tool == "str_replace" {
+            let pending_write = if tool == "edit" {
                 Some(summary.clone())
             } else {
                 None
@@ -1605,12 +1653,10 @@ fn apply_notification(app: &mut AgentApp, notif: Notification) {
                 turn: *turn,
                 max_turns: *max_turns,
                 last_tool: tool.clone(),
-                last_summary: summary.clone(),
                 files_read,
                 files_written,
                 pending_write,
                 last_ok: true,
-                last_detail: String::new(),
             });
             app.push(SessionEntryKind::ToolCall, format!("{tool}  {summary}"));
             return;
@@ -1622,7 +1668,6 @@ fn apply_notification(app: &mut AgentApp, notif: Notification) {
         } => {
             if let Some(live) = app.agent_live.as_mut() {
                 live.last_ok = *ok;
-                live.last_detail = detail[..detail.len().min(160)].to_string();
                 // Confirm a pending write succeeded.
                 if *ok {
                     if let Some(path) = live.pending_write.take()
@@ -1640,7 +1685,8 @@ fn apply_notification(app: &mut AgentApp, notif: Notification) {
                 } else {
                     SessionEntryKind::ToolErr
                 };
-                app.push(kind, detail[..detail.len().min(160)].to_string());
+                let display = summarize_tool_result_detail(detail);
+                app.push(kind, display[..display.len().min(160)].to_string());
             }
             return;
         }
@@ -1664,6 +1710,57 @@ fn apply_notification(app: &mut AgentApp, notif: Notification) {
 
     if let Some(text) = format_notification(&notif) {
         app.push(SessionEntryKind::Progress, text);
+    }
+}
+
+fn summarize_tool_result_detail(detail: &str) -> String {
+    match serde_json::from_str::<serde_json::Value>(detail) {
+        Ok(serde_json::Value::Object(obj)) => summarize_tool_result_json(&obj),
+        _ => detail.to_string(),
+    }
+}
+
+fn summarize_tool_result_json(obj: &serde_json::Map<String, serde_json::Value>) -> String {
+    let status = obj.get("status").and_then(serde_json::Value::as_str);
+    let command = obj.get("command").and_then(serde_json::Value::as_str);
+    let message = obj.get("message").and_then(serde_json::Value::as_str);
+    let failure_kind = obj.get("failure_kind").and_then(serde_json::Value::as_str);
+    let exit_code = obj.get("exit_code").and_then(serde_json::Value::as_i64);
+    let stdout = obj
+        .get("stdout")
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+    let stderr = obj
+        .get("stderr")
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+
+    match status {
+        Some("success") => match (command, exit_code) {
+            (Some(command), Some(code)) => format!("{command} succeeded (exit {code})"),
+            (Some(command), None) => format!("{command} succeeded"),
+            _ => serde_json::Value::Object(obj.clone()).to_string(),
+        },
+        Some("failed") => {
+            let head = match (command, failure_kind, exit_code) {
+                (Some(command), Some(kind), Some(code)) => {
+                    format!("{command} failed [{kind}] (exit {code})")
+                }
+                (Some(command), Some(kind), None) => format!("{command} failed [{kind}]"),
+                (Some(command), None, Some(code)) => format!("{command} failed (exit {code})"),
+                (Some(command), None, None) => format!("{command} failed"),
+                _ => "Command failed".to_string(),
+            };
+            let tail = message.or(stderr).or(stdout).unwrap_or_default();
+            if tail.is_empty() {
+                head
+            } else {
+                format!("{head}: {tail}")
+            }
+        }
+        _ => serde_json::Value::Object(obj.clone()).to_string(),
     }
 }
 
@@ -1740,7 +1837,7 @@ fn format_notification(notif: &Notification) -> Option<String> {
             Some(format!("{stage_label}: {status_label}"))
         }
         Notification::FrontierRaised { reason, summary } => {
-            // summary now contains failed-verifier detail (e.g. "npm_test: npm test: err…")
+            // summary contains failed-verifier detail from the runtime.
             Some(format!("⚠ Blocked [{reason:?}] — {summary}"))
         }
         Notification::Note { text } => Some(text.clone()),
@@ -1865,55 +1962,20 @@ fn build_agent_live_pane(live: &AgentLiveState, elapsed: Option<Duration>) -> Pa
     ]));
     lines.push(Line::raw(""));
 
-    // Last tool call
     let tool_color = if live.last_ok {
         Color::Green
     } else {
         Color::Red
     };
+    lines.push(Line::styled(
+        "current tool",
+        Style::default().fg(Color::DarkGray),
+    ));
     lines.push(Line::from(vec![
         Span::styled("→ ", Style::default().fg(Color::Blue)),
         Span::styled(live.last_tool.to_string(), Style::default().fg(tool_color)),
     ]));
-    // Summary: wrap at pane width (~34 chars)
-    for chunk in live.last_summary.chars().collect::<Vec<_>>().chunks(32) {
-        lines.push(Line::from(vec![
-            Span::raw("  "),
-            Span::styled(
-                chunk.iter().collect::<String>(),
-                Style::default().fg(Color::DarkGray),
-            ),
-        ]));
-    }
 
-    // Last result detail
-    if !live.last_detail.is_empty() {
-        let result_color = if live.last_ok {
-            Color::DarkGray
-        } else {
-            Color::Red
-        };
-        let sym = if live.last_ok { "✓" } else { "✗" };
-        lines.push(Line::raw(""));
-        let mut first = true;
-        for chunk in live.last_detail.chars().collect::<Vec<_>>().chunks(32) {
-            let chunk_str = chunk.iter().collect::<String>();
-            if first {
-                lines.push(Line::from(vec![
-                    Span::styled(format!("{sym} "), Style::default().fg(tool_color)),
-                    Span::styled(chunk_str, Style::default().fg(result_color)),
-                ]));
-                first = false;
-            } else {
-                lines.push(Line::from(vec![
-                    Span::raw("  "),
-                    Span::styled(chunk_str, Style::default().fg(result_color)),
-                ]));
-            }
-        }
-    }
-
-    // Files read
     if !live.files_read.is_empty() {
         lines.push(Line::raw(""));
         lines.push(Line::styled("read:", Style::default().fg(Color::DarkGray)));
@@ -1930,7 +1992,6 @@ fn build_agent_live_pane(live: &AgentLiveState, elapsed: Option<Duration>) -> Pa
         }
     }
 
-    // Files written / modified
     if !live.files_written.is_empty() {
         lines.push(Line::raw(""));
         lines.push(Line::styled("wrote:", Style::default().fg(Color::DarkGray)));
@@ -1961,6 +2022,7 @@ fn build_idle_pane(
     model: &str,
     workspace: &str,
     git_branch: Option<&str>,
+    knowledge: &KnowledgeUiConfig,
     last_files: &[String],
     can_undo: bool,
     can_commit: bool,
@@ -1992,6 +2054,36 @@ fn build_idle_pane(
         lines.push(Line::from(vec![
             Span::raw("  "),
             Span::styled(format!("git:{branch}"), Style::default().fg(branch_color)),
+        ]));
+    }
+
+    lines.push(Line::raw(""));
+    lines.push(Line::styled(
+        "knowledge",
+        Style::default().fg(Color::DarkGray),
+    ));
+    lines.push(Line::from(vec![
+        Span::raw("  "),
+        Span::styled(
+            if knowledge.external_fetch {
+                "external on"
+            } else {
+                "external off"
+            },
+            Style::default().fg(if knowledge.external_fetch {
+                Color::Green
+            } else {
+                Color::DarkGray
+            }),
+        ),
+    ]));
+    if !knowledge.sources.is_empty() {
+        lines.push(Line::from(vec![
+            Span::raw("  "),
+            Span::styled(
+                knowledge.sources.join(", "),
+                Style::default().fg(Color::DarkGray),
+            ),
         ]));
     }
 
@@ -2174,6 +2266,7 @@ fn draw_agent(terminal: &mut AppTerminal, app: &AgentApp) -> Result<(), CliError
                         model,
                         &workspace,
                         app.git_branch.as_deref(),
+                        &app.context.knowledge_config,
                         &app.last_session_files,
                         app.can_undo,
                         app.can_commit,
@@ -2542,7 +2635,12 @@ fn summarize_task_view(view: &TaskView) -> String {
 
 fn handle_config(command: ConfigCommand, context: &AppContext) -> Result<(), CliError> {
     match command {
-        ConfigCommand::Show => print_json(&context.config)?,
+        ConfigCommand::Show => print_json(&ConfigView {
+            config_path: context.config_path.display().to_string(),
+            knowledge_config_path: context.knowledge_config_path.display().to_string(),
+            app: context.config.clone(),
+            knowledge: context.knowledge_config.clone(),
+        })?,
         ConfigCommand::Init { force } => {
             context.init_config(force)?;
             println!("wrote {}", context.config_path.display());
@@ -2983,6 +3081,15 @@ fn write_default_config(path: &Path) -> Result<(), CliError> {
     Ok(())
 }
 
+fn write_default_knowledge_config(path: &Path) -> Result<(), CliError> {
+    let Some(parent) = path.parent() else {
+        return Err(CliError::ConfigMissing(path.display().to_string()));
+    };
+    std::fs::create_dir_all(parent)?;
+    std::fs::write(path, default_knowledge_config_template())?;
+    Ok(())
+}
+
 fn some_if_any<T>(values: Vec<T>) -> Option<Vec<T>> {
     if values.is_empty() {
         None
@@ -2999,6 +3106,19 @@ timeout_secs = 300
 recipe_id = "manual.inspect-propose"
 recipe_version = "v1"
 decided_by = "user"
+"#
+}
+
+fn default_knowledge_config_template() -> &'static str {
+    r#"external_fetch = true
+sources = [
+  "catalog",
+  "registry_metadata",
+  "deepwiki",
+  "docs_rs",
+  "repository_readme",
+  "public_search",
+]
 "#
 }
 
@@ -3191,5 +3311,39 @@ mod tests {
         });
         assert!(summary.contains("candidate files:"));
         assert!(summary.contains("crates/shunt-localize/src/lib.rs"));
+    }
+
+    #[test]
+    fn summarize_tool_result_detail_formats_command_failure_json() {
+        let summary = summarize_tool_result_detail(
+            r#"{
+  "command": "npm_create_vite frontend --template react-ts",
+  "exit_code": -1,
+  "failure_kind": "spawn_error",
+  "message": "Error spawning 'npm_create_vite': No such file or directory (os error 2)",
+  "recovery": [],
+  "status": "failed",
+  "stderr": "",
+  "stdout": ""
+}"#,
+        );
+        assert_eq!(
+            summary,
+            "npm_create_vite frontend --template react-ts failed [spawn_error] (exit -1): Error spawning 'npm_create_vite': No such file or directory (os error 2)"
+        );
+    }
+
+    #[test]
+    fn summarize_tool_result_detail_formats_command_success_json() {
+        let summary = summarize_tool_result_detail(
+            r#"{
+  "status": "success",
+  "command": "npm install --prefix frontend",
+  "exit_code": 0,
+  "stdout": "",
+  "stderr": ""
+}"#,
+        );
+        assert_eq!(summary, "npm install --prefix frontend succeeded (exit 0)");
     }
 }

@@ -41,6 +41,14 @@ pub fn run_commands(
         .collect()
 }
 
+/// Run one command with a working directory relative to the workspace root, rather
+/// than the workspace root itself — for build/test commands scoped to a monorepo
+/// subproject.
+pub fn run_command_at(workspace_root: &str, cwd_rel: &str, spec: &CommandSpec) -> CommandOutcome {
+    let cwd = Path::new(workspace_root).join(cwd_rel);
+    execute_one(&cwd, spec, Duration::from_secs(DEFAULT_TIMEOUT_SECS))
+}
+
 fn execute_one(cwd: &Path, spec: &CommandSpec, timeout: Duration) -> CommandOutcome {
     debug!(program = %spec.program, args = ?spec.args, "executing command");
 

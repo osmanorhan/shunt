@@ -24,7 +24,7 @@ use shunt_localize::{Localizer, SemanticLocalizer};
 
 // ── Manifest file names recognised by ManifestProbe ──────────────────────────
 
-const MANIFEST_NAMES: &[&str] = &[
+pub(crate) const MANIFEST_NAMES: &[&str] = &[
     "cargo.toml",
     "package.json",
     "pyproject.toml",
@@ -44,7 +44,7 @@ const MANIFEST_NAMES: &[&str] = &[
     "bunfig.toml",
 ];
 
-fn is_manifest(name: &str) -> bool {
+pub(crate) fn is_manifest(name: &str) -> bool {
     MANIFEST_NAMES.contains(&name)
 }
 

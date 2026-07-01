@@ -394,5 +394,66 @@ pub fn suite() -> Vec<CapabilityTask> {
                 ("README.md", |c| c.contains("--json")),
             ],
         },
+        CapabilityTask {
+            name: "knowledge_zod_retry_count",
+            difficulty: Difficulty::Hard,
+            request: "In src/env.ts, tighten the existing zod-based RETRY_COUNT parsing. Follow the installed package manual so invalid values fall back to 3 using z.coerce.number().int().min(1).catch(3).",
+            files: &[
+                (
+                    "package.json",
+                    "{\n  \"name\": \"env-tools\",\n  \"version\": \"1.0.0\",\n  \"type\": \"module\",\n  \"dependencies\": {\n    \"zod\": \"^3.22.4\"\n  }\n}\n",
+                ),
+                (
+                    "package-lock.json",
+                    "{\n  \"name\": \"env-tools\",\n  \"lockfileVersion\": 3,\n  \"packages\": {\n    \"\": {\n      \"dependencies\": {\n        \"zod\": \"^3.22.4\"\n      }\n    },\n    \"node_modules/zod\": {\n      \"version\": \"3.22.4\"\n    }\n  }\n}\n",
+                ),
+                (
+                    ".shunt/manuals/catalog.json",
+                    "[{\n  \"ecosystem\": \"npm\",\n  \"package\": \"zod\",\n  \"version\": \"3.22.4\",\n  \"source\": \"manual-catalog\",\n  \"locator\": \"zod/coerce-number-defaults\",\n  \"title\": \"Coerced numeric env values\",\n  \"text\": \"Use z.coerce.number().int().min(1).catch(3) when parsing optional positive integer environment variables so bad input falls back to 3.\",\n  \"keywords\": [\"zod\", \"coerce\", \"number\", \"catch\", \"env\"]\n}]\n",
+                ),
+                (
+                    "src/env.ts",
+                    "import { z } from \"zod\";\n\nexport interface AppEnv {\n  retryCount: number;\n}\n\nexport function loadEnv(env: NodeJS.ProcessEnv = process.env): AppEnv {\n  const retryCount = z.coerce.number().parse(env.RETRY_COUNT ?? \"3\");\n  return { retryCount };\n}\n",
+                ),
+            ],
+            checks: &[("src/env.ts", |c| {
+                c.contains("z.coerce")
+                    && c.contains(".number()")
+                    && c.contains(".int()")
+                    && c.contains(".min(1)")
+                    && c.contains(".catch(3)")
+                    && c.contains("RETRY_COUNT")
+            })],
+        },
+        CapabilityTask {
+            name: "knowledge_ratatui_layout_split",
+            difficulty: Difficulty::Hard,
+            request: "In src/ui.rs, replace the placeholder panel split with the installed ratatui Layout API. Follow the exact versioned manual pattern `Layout::vertical([Constraint::Length(3), Constraint::Min(0)]).split(area)` so the area is split into a header row of length 3 and a body area with the remaining space.",
+            files: &[
+                (
+                    "Cargo.toml",
+                    "[package]\nname = \"ui-demo\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[dependencies]\nratatui = \"0.29\"\n",
+                ),
+                (
+                    "Cargo.lock",
+                    "[[package]]\nname = \"ratatui\"\nversion = \"0.29.0\"\n",
+                ),
+                ("src/lib.rs", "pub mod ui;\n"),
+                (
+                    ".shunt/manuals/catalog.json",
+                    "[{\n  \"ecosystem\": \"cargo\",\n  \"package\": \"ratatui\",\n  \"version\": \"0.29.0\",\n  \"source\": \"manual-catalog\",\n  \"locator\": \"ratatui/layout-vertical\",\n  \"title\": \"Vertical splits\",\n  \"text\": \"In ratatui 0.29.0, prefer Layout::vertical([Constraint::Length(3), Constraint::Min(0)]).split(area) to create a fixed header and flexible body. This exact pattern replaces manual Rect math.\",\n  \"keywords\": [\"layout\", \"vertical\", \"constraint\", \"split\"]\n}]\n",
+                ),
+                (
+                    "src/ui.rs",
+                    "use ratatui::layout::{Constraint, Layout, Rect};\n\npub fn split_panels(area: Rect) -> (Rect, Rect) {\n    let sections = [area, area];\n    (sections[0], sections[1])\n}\n",
+                ),
+            ],
+            checks: &[("src/ui.rs", |c| {
+                c.contains("Layout::vertical")
+                    && c.contains("Constraint::Length(3)")
+                    && c.contains("Constraint::Min(0)")
+                    && c.contains("split(area)")
+            })],
+        },
     ]
 }

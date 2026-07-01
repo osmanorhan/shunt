@@ -7,7 +7,6 @@ pub mod session;
 
 use std::fs;
 use std::path::Path;
-use std::process::Command;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -22,8 +21,8 @@ use shunt_core::{
     VerifierOutcome, VerifierStatus,
 };
 use shunt_infer::{
-    AgentObserver, AgentResult, AgentSession, ClarifyNode, SourceFileContext, ToolProvider,
-    UnderstandNode,
+    AgentObserver, AgentPauseState, AgentResult, AgentSession, ClarifyNode, CriterionOutcome,
+    KnowledgePlanNode, KnowledgePlanOutput, SourceFileContext, ToolProvider, UnderstandNode,
 };
 use shunt_knowledge::KnowledgeService;
 use shunt_localize::{ContextPacket, Localizer, RetrievalBackend, SearchQuery, SemanticLocalizer};
@@ -112,7 +111,7 @@ impl RuntimeObserver for NoopRuntimeObserver {
 
 pub struct TaskRuntime {
     pub(crate) store: SqliteStore,
-    knowledge: KnowledgeService,
+    knowledge: Arc<KnowledgeService>,
     orchestrator: ScopeOrchestrator,
     localizer: SemanticLocalizer,
     observer: Arc<dyn RuntimeObserver>,
@@ -129,11 +128,26 @@ pub struct HandleResult {
     pub frontier_cases: Vec<FrontierCase>,
 }
 
+/// Adapter exposing [`KnowledgeService`] to the agent loop's `knowledge` tool,
+/// keeping `shunt-infer` independent of `shunt-knowledge`.
+struct KnowledgeToolBackend {
+    service: Arc<KnowledgeService>,
+    workspace_root: std::path::PathBuf,
+}
+
+impl shunt_infer::KnowledgeLookup for KnowledgeToolBackend {
+    fn lookup(&self, query: &str) -> Result<String, String> {
+        self.service
+            .query(&self.workspace_root, query)
+            .map_err(|e| e.to_string())
+    }
+}
+
 impl TaskRuntime {
     pub fn new(store: SqliteStore) -> Self {
         Self {
             store,
-            knowledge: KnowledgeService::default(),
+            knowledge: Arc::new(KnowledgeService::default()),
             orchestrator: ScopeOrchestrator::default(),
             localizer: SemanticLocalizer::default(),
 
@@ -146,7 +160,7 @@ impl TaskRuntime {
     pub fn with_knowledge(store: SqliteStore, knowledge: KnowledgeService) -> Self {
         Self {
             store,
-            knowledge,
+            knowledge: Arc::new(knowledge),
             orchestrator: ScopeOrchestrator::default(),
             localizer: SemanticLocalizer::default(),
 
@@ -159,7 +173,7 @@ impl TaskRuntime {
     pub fn with_observer(store: SqliteStore, observer: Arc<dyn RuntimeObserver>) -> Self {
         Self {
             store,
-            knowledge: KnowledgeService::default(),
+            knowledge: Arc::new(KnowledgeService::default()),
             orchestrator: ScopeOrchestrator::default(),
             localizer: SemanticLocalizer::default(),
 
@@ -176,7 +190,7 @@ impl TaskRuntime {
     ) -> Self {
         Self {
             store,
-            knowledge,
+            knowledge: Arc::new(knowledge),
             orchestrator: ScopeOrchestrator::default(),
             localizer: SemanticLocalizer::default(),
 
@@ -327,7 +341,7 @@ impl TaskRuntime {
 
         let knowledge =
             self.knowledge
-                .gather(Path::new(&task.workspace_root), &artifact, &packet)?;
+                .gather(Path::new(&task.workspace_root), &artifact, &packet, &[])?;
         artifact.package_facts = knowledge.package_facts;
         artifact.manual_evidence = knowledge.manual_evidence;
         trace_manual_context(&artifact);
@@ -699,6 +713,19 @@ impl TaskRuntime {
         let Some(mut artifact) = self.store.get_understanding_artifact(artifact_id)? else {
             return Ok(None);
         };
+        let Some(task) = self.store.get_task_run(&artifact.task_id.0)? else {
+            return Ok(Some(artifact));
+        };
+
+        let research_packet = research_context_packet(&artifact);
+        let knowledge_plan = plan_knowledge(provider, &artifact)?;
+        apply_planned_knowledge(
+            &self.knowledge,
+            &task.workspace_root,
+            &research_packet,
+            &mut artifact,
+            knowledge_plan,
+        )?;
 
         let agent_context = load_agent_context_with_knowledge(
             &self.store,
@@ -864,6 +891,19 @@ impl TaskRuntime {
         let Some(mut artifact) = self.understand_task(artifact_id, now)? else {
             return Ok(None);
         };
+        let Some(task) = self.store.get_task_run(&artifact.task_id.0)? else {
+            return Ok(Some(artifact));
+        };
+
+        let research_packet = research_context_packet(&artifact);
+        let knowledge_plan = plan_knowledge(provider, &artifact)?;
+        apply_planned_knowledge(
+            &self.knowledge,
+            &task.workspace_root,
+            &research_packet,
+            &mut artifact,
+            knowledge_plan,
+        )?;
 
         let agent_context = load_agent_context_with_knowledge(
             &self.store,
@@ -1106,7 +1146,7 @@ impl TaskRuntime {
             .store
             .get_task_run(task_id)?
             .ok_or_else(|| RuntimeError::TaskNotFound(task_id.into()))?;
-        let artifact = self
+        let mut artifact = self
             .store
             .get_understanding_artifact(&task.current_artifact.0)?
             .ok_or_else(|| RuntimeError::TaskNotFound(task_id.into()))?;
@@ -1145,6 +1185,26 @@ impl TaskRuntime {
             }
             Err(e) => return Err(e),
         };
+
+        let research_packet = research_context_packet(&artifact);
+        let knowledge_plan = plan_knowledge(provider, &artifact)?;
+        let manual_count_before = artifact.manual_evidence.len();
+        let package_count_before = artifact.package_facts.len();
+        apply_planned_knowledge(
+            &self.knowledge,
+            &task.workspace_root,
+            &research_packet,
+            &mut artifact,
+            knowledge_plan,
+        )?;
+        if artifact.manual_evidence.len() != manual_count_before
+            || artifact.package_facts.len() != package_count_before
+        {
+            artifact.revision += 1;
+            artifact.updated_at = now;
+            self.store.put_understanding_artifact(&artifact)?;
+        }
+
         let candidates = self.gather_change_candidates(&task.workspace_root, &artifact)?;
         tracing::debug!(
             "change candidates: {}",
@@ -1186,7 +1246,11 @@ impl TaskRuntime {
             .with_budget(session_budget.clone())
             .with_wall_timeout(PROPOSE_SESSION_WALL_TIMEOUT)
             .with_pre_loaded(&all_candidates)
-            .with_ignore_patterns(extra_ignore_patterns.iter().cloned());
+            .with_ignore_patterns(extra_ignore_patterns.iter().cloned())
+            .with_knowledge(Arc::new(KnowledgeToolBackend {
+                service: self.knowledge.clone(),
+                workspace_root: task.workspace_root.clone().into(),
+            }));
         if let Some(obs) = self.agent_observer.clone() {
             session = session.with_observer(obs);
         }
@@ -1228,9 +1292,14 @@ impl TaskRuntime {
             // Baseline check: capture pre-existing errors before the agent runs.
             // The fix loop only fires when the agent INTRODUCES new errors, not for
             // pre-existing issues (e.g. deprecated tsconfig options).
-            let baseline_errors = workspace_check(&task.workspace_root);
+            let baseline_errors = workspace_check(&task.workspace_root, &[]);
 
-            let execute_request = execution_request(&artifact);
+            let execute_request = execution_request_with_context(
+                &self.store,
+                &artifact.task_id.0,
+                &self.knowledge,
+                &artifact,
+            );
             let first_result = session.run(&execute_request);
 
             match first_result {
@@ -1269,7 +1338,11 @@ impl TaskRuntime {
                             .with_budget(session_budget.clone())
                             .with_wall_timeout(REPAIR_SESSION_WALL_TIMEOUT)
                             .with_pre_loaded(&fix_pre_loaded)
-                            .with_ignore_patterns(extra_ignore_patterns.iter().cloned());
+                            .with_ignore_patterns(extra_ignore_patterns.iter().cloned())
+                            .with_knowledge(Arc::new(KnowledgeToolBackend {
+                                service: self.knowledge.clone(),
+                                workspace_root: task.workspace_root.clone().into(),
+                            }));
                         if let Some(obs) = self.agent_observer.clone() {
                             fix_session = fix_session.with_observer(obs);
                         }
@@ -1296,8 +1369,22 @@ impl TaskRuntime {
                     }
                 }
                 AgentResult::NeedsClarification {
-                    question, context, ..
+                    question,
+                    context,
+                    turns,
+                    file_state,
+                    partial_ops,
                 } => {
+                    self.store.put_agent_pause(
+                        &task.id.0,
+                        now,
+                        &AgentPauseState {
+                            task: execute_request,
+                            turns,
+                            file_state,
+                            partial_ops,
+                        },
+                    )?;
                     return Err(RuntimeError::AgentNeedsClarification { question, context });
                 }
                 AgentResult::MaxTurnsReached => {
@@ -1329,6 +1416,99 @@ impl TaskRuntime {
         recipe_run.change_set = Some(change_set);
         recipe_run.updated_at = now;
         self.store.put_recipe_run(&recipe_run)?;
+
+        Ok(recipe_run)
+    }
+
+    pub fn resume_agent<P>(
+        &self,
+        task_id: &str,
+        now: OffsetDateTime,
+        provider: &P,
+        answer: &str,
+        extra_ignore_patterns: &[String],
+    ) -> RuntimeResult<RecipeRun>
+    where
+        P: ToolProvider,
+    {
+        tracing::debug!("resume_agent task={task_id}");
+        let task = self
+            .store
+            .get_task_run(task_id)?
+            .ok_or_else(|| RuntimeError::TaskNotFound(task_id.into()))?;
+        let artifact = self
+            .store
+            .get_understanding_artifact(&task.current_artifact.0)?
+            .ok_or_else(|| RuntimeError::TaskNotFound(task_id.into()))?;
+        let mut recipe_run = self.load_active_recipe_run(&task)?;
+        let pause = self
+            .store
+            .get_agent_pause::<AgentPauseState>(&task.id.0)?
+            .ok_or_else(|| RuntimeError::Other("agent pause not found".into()))?;
+        let paused_task = pause.task.clone();
+        let session_budget = {
+            let mut b = provider.capabilities().to_session_budget();
+            if let Some(o) = &self.budget_override {
+                b.apply_override(o);
+            }
+            b
+        };
+        let result = AgentSession::resume_paused(
+            provider,
+            &task.workspace_root,
+            pause,
+            answer,
+            session_budget,
+            self.agent_observer.clone(),
+            extra_ignore_patterns.to_vec(),
+        );
+        let change_set = match result {
+            AgentResult::Done {
+                ops,
+                setup_commands,
+                ..
+            } => build_agent_change_set(ops, setup_commands),
+            AgentResult::NeedsClarification {
+                question,
+                context,
+                turns,
+                file_state,
+                partial_ops,
+            } => {
+                self.store.put_agent_pause(
+                    &task.id.0,
+                    now,
+                    &AgentPauseState {
+                        task: paused_task,
+                        turns,
+                        file_state,
+                        partial_ops,
+                    },
+                )?;
+                return Err(RuntimeError::AgentNeedsClarification { question, context });
+            }
+            AgentResult::MaxTurnsReached => {
+                return Err(RuntimeError::Other(
+                    "agent hit max turns without completing".into(),
+                ));
+            }
+        };
+
+        if let Some(error) = validate_work_contract(&task.workspace_root, &artifact, &change_set) {
+            return Err(RuntimeError::Other(error));
+        }
+        if let Some(stage) = recipe_run
+            .stages
+            .iter_mut()
+            .find(|stage| stage.kind == ExecutionStageKind::Apply)
+        {
+            stage.summary = format!("generated {} ops", change_set.ops.len());
+            stage.started_at = Some(stage.started_at.unwrap_or(now));
+        }
+        recipe_run.change_set = Some(change_set);
+        recipe_run.updated_at = now;
+        self.store.put_recipe_run(&recipe_run)?;
+        self.store.delete_agent_pause(&task.id.0)?;
 
         Ok(recipe_run)
     }
@@ -1399,11 +1579,13 @@ impl TaskRuntime {
             .ok_or_else(|| RuntimeError::TaskNotFound(task_id.into()))?;
         let mut recipe_run = self.load_active_recipe_run(&task)?;
 
+        // This gate runs before Apply — it checks the plan is ready to commit, not
+        // whether the (not-yet-applied) change works. Build/test runs post-Apply in
+        // execute_validate, where files are actually on disk.
         let verifiers = vec![
             approval_verifier(&artifact),
             evidence_verifier(&artifact),
             ambiguity_verifier(&artifact),
-            workspace_test_verifier(&task.workspace_root)?,
         ];
         let failed = verifiers
             .iter()
@@ -1518,8 +1700,13 @@ impl TaskRuntime {
         ensure_current_stage(&recipe_run, ExecutionStageKind::Validate)?;
         ensure_stage_passed(&recipe_run, ExecutionStageKind::Apply)?;
 
-        let verifier = workspace_test_verifier(&task.workspace_root)?;
-        let passed = verifier.status == VerifierStatus::Passed;
+        let changed_paths: Vec<String> = recipe_run
+            .change_set
+            .as_ref()
+            .map(|cs| cs.ops.iter().map(|op| op.path().to_string()).collect())
+            .unwrap_or_default();
+        let verifier = workspace_test_verifier(&task.workspace_root, &changed_paths);
+        let passed = verifier.status != VerifierStatus::Failed;
         tracing::debug!(
             "validate verifier: {}={:?}",
             verifier.verifier,
@@ -1818,6 +2005,21 @@ fn load_agent_context_with_knowledge(
     }
 }
 
+fn execution_request_with_context(
+    store: &SqliteStore,
+    task_id: &str,
+    knowledge: &KnowledgeService,
+    artifact: &UnderstandingArtifact,
+) -> String {
+    let request = execution_request(artifact);
+    let agent_context = load_agent_context_with_knowledge(store, task_id, knowledge, artifact);
+    if agent_context.is_empty() {
+        request
+    } else {
+        format!("{request}\n\n{agent_context}")
+    }
+}
+
 fn execution_request(artifact: &UnderstandingArtifact) -> String {
     let contract = contract_prompt_section(artifact);
     if contract.is_empty() {
@@ -1825,6 +2027,131 @@ fn execution_request(artifact: &UnderstandingArtifact) -> String {
     } else {
         format!("{}\n\n{}", artifact.original_request, contract)
     }
+}
+
+fn build_agent_change_set(
+    ops: Vec<shunt_infer::ProposedFileOp>,
+    setup_commands: Vec<shunt_infer::ProposedCommand>,
+) -> ChangeSet {
+    let ops: Vec<FileOp> = ops
+        .into_iter()
+        .map(|op| match op {
+            shunt_infer::ProposedFileOp::Edit {
+                path,
+                search,
+                replacement,
+            } => FileOp::Edit {
+                path,
+                search,
+                replacement,
+            },
+            shunt_infer::ProposedFileOp::Create { path, contents } => {
+                FileOp::Create { path, contents }
+            }
+            shunt_infer::ProposedFileOp::Delete { path } => FileOp::Delete { path },
+        })
+        .collect();
+    let commands = setup_commands
+        .into_iter()
+        .map(|c| shunt_core::CommandSpec {
+            program: c.program,
+            args: c.args,
+        })
+        .collect();
+    ChangeSet { ops, commands }
+}
+
+/// Stable IDs for every acceptance criterion the artifact carries — one per success
+/// criterion and per behavioral check. IDs are positional (`sc-1`, `bc-1`, ...) so the
+/// runtime can check the verifier addressed each one without depending on the model to
+/// invent consistent identifiers itself.
+fn acceptance_criteria(artifact: &UnderstandingArtifact) -> Vec<(String, String)> {
+    let mut items: Vec<(String, String)> = artifact
+        .success_criteria
+        .iter()
+        .enumerate()
+        .map(|(i, text)| (format!("sc-{}", i + 1), text.clone()))
+        .collect();
+    items.extend(
+        artifact
+            .work_contract
+            .behavioral_checks
+            .iter()
+            .enumerate()
+            .map(|(i, text)| (format!("bc-{}", i + 1), text.clone())),
+    );
+    items
+}
+
+fn criteria_prompt_section(criteria: &[(String, String)]) -> String {
+    if criteria.is_empty() {
+        return String::new();
+    }
+    let mut section =
+        String::from("\n\nACCEPTANCE CRITERIA — call done with one criteria entry per ID:\n");
+    for (id, text) in criteria {
+        section.push_str(&format!("- {id}: {text}\n"));
+    }
+    section
+}
+
+/// Result of checking a verifier's reported criteria against the required set.
+enum VerifierVerdict {
+    Pass,
+    Fail(String),
+}
+
+/// Compute pass/fail from structured criteria instead of sniffing prose. Fails closed:
+/// any criterion the verifier never addressed, or explicitly marked failed, fails the
+/// whole verdict. Tasks with no stated acceptance criteria and no ad-hoc criteria from
+/// the verifier pass trivially — there is nothing to check.
+fn evaluate_verifier_criteria(
+    required: &[(String, String)],
+    reported: &[CriterionOutcome],
+) -> VerifierVerdict {
+    let reported_by_id: std::collections::HashMap<&str, &CriterionOutcome> =
+        reported.iter().map(|c| (c.id.as_str(), c)).collect();
+
+    let missing: Vec<&str> = required
+        .iter()
+        .map(|(id, _)| id.as_str())
+        .filter(|id| !reported_by_id.contains_key(id))
+        .collect();
+    if !missing.is_empty() {
+        return VerifierVerdict::Fail(format!(
+            "verifier did not address criteria: {}",
+            missing.join(", ")
+        ));
+    }
+
+    let failed: Vec<String> = reported
+        .iter()
+        .filter(|c| c.status == VerifierStatus::Failed)
+        .map(|c| format!("{}: {}", c.id, c.evidence))
+        .collect();
+    if !failed.is_empty() {
+        return VerifierVerdict::Fail(failed.join("; "));
+    }
+
+    VerifierVerdict::Pass
+}
+
+fn verifier_failure_output(description: &str, reported: &[CriterionOutcome]) -> String {
+    let mut out = String::new();
+    if !reported.is_empty() {
+        out.push_str("Criteria:\n");
+        for c in reported {
+            out.push_str(&format!("- {} [{:?}]: {}\n", c.id, c.status, c.evidence));
+        }
+    }
+    if !description.trim().is_empty() {
+        if !out.is_empty() {
+            out.push('\n');
+        }
+        out.push_str("Notes: ");
+        out.push_str(description.trim());
+    }
+    out
 }
 
 fn contract_prompt_section(artifact: &UnderstandingArtifact) -> String {
@@ -1961,49 +2288,103 @@ fn workspace_relative_path(workspace_root: &str, path: &str) -> Option<String> {
     Some(relative.to_string_lossy().into_owned())
 }
 
+/// Ecosystems with a known build/test command. Unrecognised manifests (pom.xml,
+/// build.gradle, composer.json, ...) are reported as skipped rather than guessed at —
+/// add a branch here to extend coverage, don't bolt on string-sniffing elsewhere.
+enum ManifestKind {
+    Cargo,
+    Npm,
+    Go,
+    Unsupported,
+}
+
+fn manifest_kind(name: &str) -> ManifestKind {
+    match name {
+        "cargo.toml" => ManifestKind::Cargo,
+        "package.json" => ManifestKind::Npm,
+        "go.mod" => ManifestKind::Go,
+        _ => ManifestKind::Unsupported,
+    }
+}
+
+/// (build command, test command) for a manifest kind, or `None` if this ecosystem has
+/// no supported command yet.
+fn build_test_commands(
+    kind: &ManifestKind,
+) -> Option<(shunt_core::CommandSpec, shunt_core::CommandSpec)> {
+    match kind {
+        ManifestKind::Cargo => Some((
+            shunt_core::CommandSpec::new("cargo", ["build", "--quiet"]),
+            shunt_core::CommandSpec::new("cargo", ["test", "--quiet"]),
+        )),
+        ManifestKind::Npm => Some((
+            shunt_core::CommandSpec::new("npm", ["run", "build", "--if-present"]),
+            shunt_core::CommandSpec::new("npm", ["test", "--if-present"]),
+        )),
+        ManifestKind::Go => Some((
+            shunt_core::CommandSpec::new("go", ["build", "./..."]),
+            shunt_core::CommandSpec::new("go", ["test", "./..."]),
+        )),
+        ManifestKind::Unsupported => None,
+    }
+}
+
+/// Directories containing a recognised project manifest, nearest to each changed path
+/// (walking up to the workspace root) plus the workspace root itself. Driven by the
+/// changed files, not a blind directory scan — the same approach as
+/// `shunt_infer::agent::discover_project_roots`, duplicated here because it crosses a
+/// crate boundary the LLM-facing prompt builder doesn't need to know about.
+fn discover_manifest_dirs(workspace_root: &str, changed_paths: &[String]) -> Vec<(String, String)> {
+    let root = Path::new(workspace_root);
+    let mut found = Vec::new();
+    let mut seen_dirs = std::collections::HashSet::new();
+
+    let mut check_dir = |dir: &Path| {
+        let rel = dir.to_string_lossy().to_string();
+        let rel = if rel == "." { String::new() } else { rel };
+        if !seen_dirs.insert(rel.clone()) {
+            return;
+        }
+        for name in crate::probes::MANIFEST_NAMES {
+            if root.join(dir).join(name).is_file() {
+                found.push((rel.clone(), (*name).to_string()));
+                break;
+            }
+        }
+    };
+
+    check_dir(Path::new(""));
+    for changed in changed_paths {
+        let mut dir = Path::new(changed).parent();
+        while let Some(d) = dir {
+            check_dir(d);
+            if d.as_os_str().is_empty() {
+                break;
+            }
+            dir = d.parent();
+        }
+    }
+    found
+}
+
 /// Run a fast workspace sanity check after the agent writes files.
 /// Returns a structured diagnostic if the check fails, `None` if it passes or no checker is found.
-fn workspace_check(workspace_root: &str) -> Option<RepairDiagnostic> {
-    use std::process::Command;
-    let root = std::path::Path::new(workspace_root);
-    if root.join("Cargo.toml").exists() {
-        let command = "cargo check --message-format=short --quiet";
-        let out = Command::new("cargo")
-            .args(["check", "--message-format=short", "--quiet"])
-            .current_dir(root)
-            .output()
-            .ok()?;
-        if !out.status.success() {
+fn workspace_check(workspace_root: &str, changed_paths: &[String]) -> Option<RepairDiagnostic> {
+    for (dir, manifest_name) in discover_manifest_dirs(workspace_root, changed_paths) {
+        let Some((build, _test)) = build_test_commands(&manifest_kind(&manifest_name)) else {
+            continue;
+        };
+        let outcome = crate::executor::run_command_at(workspace_root, &dir, &build);
+        if !outcome.success {
             return Some(RepairDiagnostic {
-                source: "workspace_check",
-                command: Some(command.into()),
-                summary: "projected workspace check failed".into(),
-                output: truncate_chars(
-                    &String::from_utf8_lossy(&out.stderr),
-                    MAX_REPAIR_OUTPUT_CHARS,
+                source: "build",
+                command: Some(build.display()),
+                summary: format!(
+                    "build failed in '{}'",
+                    if dir.is_empty() { "." } else { &dir }
                 ),
+                output: truncate_chars(&format_command_outcome(&outcome), MAX_REPAIR_OUTPUT_CHARS),
             });
-        }
-    } else if root.join("package.json").exists() {
-        // Use `tsc --noEmit` if tsconfig present, else skip (npm test is too slow for inline loop).
-        if root.join("tsconfig.json").exists() {
-            let command = "npx tsc --noEmit --pretty false";
-            let out = Command::new("npx")
-                .args(["tsc", "--noEmit", "--pretty", "false"])
-                .current_dir(root)
-                .output()
-                .ok()?;
-            if !out.status.success() {
-                return Some(RepairDiagnostic {
-                    source: "workspace_check",
-                    command: Some(command.into()),
-                    summary: "projected workspace check failed".into(),
-                    output: truncate_chars(
-                        &String::from_utf8_lossy(&out.stdout),
-                        MAX_REPAIR_OUTPUT_CHARS,
-                    ),
-                });
-            }
         }
     }
     None
@@ -2043,13 +2424,6 @@ fn collect_repair_diagnostics<P: ToolProvider>(
     let projected_root_str = projected_root.to_string_lossy().into_owned();
     let mut diagnostics = Vec::new();
 
-    diagnostics.extend(structural_file_diagnostics(change_set, done_file_state));
-    diagnostics.extend(explicit_literal_coverage_diagnostics(
-        &artifact.original_request,
-        change_set,
-        done_file_state,
-    ));
-
     let safe_setup_commands: Vec<shunt_core::CommandSpec> = change_set
         .commands
         .iter()
@@ -2080,18 +2454,15 @@ fn collect_repair_diagnostics<P: ToolProvider>(
                 contents: contents.clone(),
             })
             .collect();
-        let changed = done_file_state
-            .keys()
-            .cloned()
-            .collect::<Vec<_>>()
-            .join(", ");
+        let changed_paths: Vec<String> = done_file_state.keys().cloned().collect();
+        let changed = changed_paths.join(", ");
+        let required_criteria = acceptance_criteria(artifact);
         let verify_task = format!(
             "Verify that the following changes correctly implement the task.\n\n\
-             Original task: {}\n\n{}\n\nChanged files: {changed}\n\n\
-             Run the build, then run surgical smoke tests for what changed. \
-             Call done with 'PASS: ...' or 'FAIL: ...'",
+             Original task: {}\n\n{}\nChanged files: {changed}\n{}",
             artifact.original_request,
             contract_prompt_section(artifact),
+            criteria_prompt_section(&required_criteria),
         );
         let verifier_budget = {
             let mut b = shunt_infer::SessionBudget::for_verifier();
@@ -2100,31 +2471,37 @@ fn collect_repair_diagnostics<P: ToolProvider>(
             }
             b
         };
-        let mut vsession = AgentSession::new_verifier(provider, &projected_root_str)
-            .with_budget(verifier_budget)
-            .with_wall_timeout(VERIFIER_SESSION_WALL_TIMEOUT)
-            .with_pre_loaded(&pre_loaded)
-            .with_ignore_patterns(extra_ignore_patterns.iter().cloned());
+        let mut vsession =
+            AgentSession::new_verifier(provider, &projected_root_str, &changed_paths)
+                .with_budget(verifier_budget)
+                .with_wall_timeout(VERIFIER_SESSION_WALL_TIMEOUT)
+                .with_pre_loaded(&pre_loaded)
+                .with_ignore_patterns(extra_ignore_patterns.iter().cloned());
         if let Some(obs) = observer {
             vsession = vsession.with_observer(obs);
         }
         match vsession.run(&verify_task) {
-            AgentResult::Done { description, .. } => {
-                if description.trim_start().to_uppercase().starts_with("PASS") {
-                    tracing::info!("verifier: PASS");
-                } else {
-                    tracing::info!(
-                        "verifier: FAIL — {}",
-                        &description[..description.len().min(200)]
-                    );
+            AgentResult::Done {
+                description,
+                criteria: reported_criteria,
+                ..
+            } => match evaluate_verifier_criteria(&required_criteria, &reported_criteria) {
+                VerifierVerdict::Pass => {
+                    tracing::info!("verifier: PASS ({} criteria)", reported_criteria.len());
+                }
+                VerifierVerdict::Fail(reason) => {
+                    tracing::info!("verifier: FAIL — {reason}");
                     diagnostics.push(RepairDiagnostic {
                         source: "verifier",
                         command: None,
-                        summary: "verifier reported failure".into(),
-                        output: truncate_chars(description.trim(), MAX_REPAIR_OUTPUT_CHARS),
+                        summary: format!("verifier reported failure: {reason}"),
+                        output: truncate_chars(
+                            &verifier_failure_output(&description, &reported_criteria),
+                            MAX_REPAIR_OUTPUT_CHARS,
+                        ),
                     });
                 }
-            }
+            },
             AgentResult::NeedsClarification {
                 question, context, ..
             } => diagnostics.push(RepairDiagnostic {
@@ -2141,7 +2518,7 @@ fn collect_repair_diagnostics<P: ToolProvider>(
             }
         }
 
-        if let Some(post_error) = workspace_check(&projected_root_str)
+        if let Some(post_error) = workspace_check(&projected_root_str, &changed_paths)
             && is_novel_diagnostic(baseline_error, &post_error)
         {
             diagnostics.push(post_error);
@@ -2150,220 +2527,6 @@ fn collect_repair_diagnostics<P: ToolProvider>(
 
     diagnostics.truncate(MAX_REPAIR_DIAGNOSTICS);
     Ok(diagnostics)
-}
-
-fn explicit_literal_coverage_diagnostics(
-    request: &str,
-    change_set: &ChangeSet,
-    file_state: &std::collections::HashMap<String, String>,
-) -> Vec<RepairDiagnostic> {
-    let touched_paths = change_set
-        .ops
-        .iter()
-        .map(|op| op.path().to_string())
-        .collect::<Vec<_>>();
-    if touched_paths.is_empty() {
-        return Vec::new();
-    }
-    let touched_set = touched_paths
-        .iter()
-        .cloned()
-        .collect::<std::collections::HashSet<_>>();
-    let content_literals = explicit_request_literals(request)
-        .into_iter()
-        .filter(|literal| !touched_set.contains(literal))
-        .collect::<Vec<_>>();
-    if content_literals.is_empty() {
-        return Vec::new();
-    }
-
-    let request_lower = request.to_ascii_lowercase();
-    let mut diagnostics = Vec::new();
-    for path in touched_paths {
-        let path_lower = path.to_ascii_lowercase();
-        let basename_lower = std::path::Path::new(&path)
-            .file_name()
-            .and_then(|name| name.to_str())
-            .map(|name| name.to_ascii_lowercase())
-            .unwrap_or_default();
-        if !request_lower.contains(&path_lower) && !request_lower.contains(&basename_lower) {
-            continue;
-        }
-        let Some(content) = file_state.get(&path) else {
-            continue;
-        };
-        if content_literals
-            .iter()
-            .any(|literal| content.contains(literal))
-        {
-            continue;
-        }
-        diagnostics.push(RepairDiagnostic {
-            source: "request_literal_coverage",
-            command: None,
-            summary: format!(
-                "changed file '{path}' does not contain any explicit request literals"
-            ),
-            output: format!(
-                "Request literals: {}\nFile: {path}",
-                content_literals.join(", ")
-            ),
-        });
-    }
-    diagnostics
-}
-
-fn structural_file_diagnostics(
-    change_set: &ChangeSet,
-    file_state: &std::collections::HashMap<String, String>,
-) -> Vec<RepairDiagnostic> {
-    let mut diagnostics = Vec::new();
-    let mut seen_paths = std::collections::HashSet::new();
-    for path in change_set.ops.iter().map(|op| op.path().to_string()) {
-        if !seen_paths.insert(path.clone()) {
-            continue;
-        }
-        if !is_structural_check_candidate(&path) {
-            continue;
-        }
-        let Some(content) = file_state.get(&path) else {
-            continue;
-        };
-        let warnings = structural_warnings(content);
-        if warnings.is_empty() {
-            continue;
-        }
-        diagnostics.push(RepairDiagnostic {
-            source: "structure",
-            command: None,
-            summary: format!("changed file '{path}' has structural anomalies"),
-            output: warnings.join("\n"),
-        });
-    }
-    diagnostics
-}
-
-fn is_structural_check_candidate(path: &str) -> bool {
-    matches!(
-        Path::new(path).extension().and_then(|ext| ext.to_str()),
-        Some(
-            "rs" | "ts"
-                | "tsx"
-                | "js"
-                | "jsx"
-                | "mjs"
-                | "cjs"
-                | "json"
-                | "go"
-                | "java"
-                | "c"
-                | "cc"
-                | "cpp"
-                | "h"
-                | "hpp"
-                | "cs"
-        )
-    )
-}
-
-fn structural_warnings(contents: &str) -> Vec<String> {
-    let mut warnings = Vec::new();
-    let mut brace_depth = 0i32;
-    for ch in contents.chars() {
-        match ch {
-            '{' => brace_depth += 1,
-            '}' => brace_depth -= 1,
-            _ => {}
-        }
-    }
-    if brace_depth > 0 {
-        warnings.push(format!(
-            "brace balance appears to have {brace_depth} unmatched '{{'"
-        ));
-    } else if brace_depth < 0 {
-        warnings.push(format!(
-            "brace balance appears to have {} unmatched '}}'",
-            brace_depth.abs()
-        ));
-    }
-
-    let mut declarations = std::collections::HashMap::new();
-    for (idx, line) in contents.lines().enumerate() {
-        let Some(key) = declaration_key(line) else {
-            continue;
-        };
-        if let Some(first_line) = declarations.get(&key) {
-            warnings.push(format!(
-                "duplicate declaration '{key}' at lines {first_line} and {}",
-                idx + 1
-            ));
-        } else {
-            declarations.insert(key, idx + 1);
-        }
-    }
-
-    warnings
-}
-
-fn declaration_key(line: &str) -> Option<String> {
-    let mut trimmed = line.trim();
-    for prefix in ["export default ", "export ", "pub "] {
-        if let Some(rest) = trimmed.strip_prefix(prefix) {
-            trimmed = rest.trim_start();
-        }
-    }
-    if let Some(rest) = trimmed.strip_prefix("async ") {
-        trimmed = rest.trim_start();
-    }
-
-    for prefix in [
-        "function ",
-        "fn ",
-        "class ",
-        "interface ",
-        "type ",
-        "struct ",
-        "enum ",
-        "trait ",
-    ] {
-        if let Some(rest) = trimmed.strip_prefix(prefix) {
-            let name = rest
-                .split(|ch: char| !(ch.is_ascii_alphanumeric() || ch == '_'))
-                .next()
-                .unwrap_or("")
-                .trim();
-            if !name.is_empty() {
-                return Some(format!("{} {}", prefix.trim_end(), name));
-            }
-        }
-    }
-
-    None
-}
-
-fn explicit_request_literals(request: &str) -> Vec<String> {
-    let mut literals = Vec::new();
-    let mut in_tick = false;
-    let mut current = String::new();
-    for ch in request.chars() {
-        if ch == '`' {
-            if in_tick {
-                let lit = current.trim();
-                if !lit.is_empty() {
-                    literals.push(lit.to_string());
-                }
-                current.clear();
-            }
-            in_tick = !in_tick;
-            continue;
-        }
-        if in_tick {
-            current.push(ch);
-        }
-    }
-    literals.sort();
-    literals.dedup();
-    literals
 }
 
 fn build_repair_request(execute_request: &str, diagnostics: &[RepairDiagnostic]) -> String {
@@ -2607,70 +2770,65 @@ fn ambiguity_verifier(artifact: &UnderstandingArtifact) -> VerifierOutcome {
     }
 }
 
-fn workspace_test_verifier(workspace_root: &str) -> Result<VerifierOutcome, std::io::Error> {
-    let root = Path::new(workspace_root);
-
-    let (verifier, command_label, output) = if root.join("Cargo.toml").is_file() {
-        tracing::debug!("run command: cargo test --quiet cwd={workspace_root}");
-        (
-            "cargo_test",
-            "cargo test --quiet",
-            Command::new("cargo")
-                .arg("test")
-                .arg("--quiet")
-                .current_dir(workspace_root)
-                .output()?,
-        )
-    } else if root.join("package.json").is_file() {
-        tracing::debug!("run command: npm test --silent cwd={workspace_root}");
-        (
-            "npm_test",
-            "npm test --silent",
-            Command::new("npm")
-                .arg("test")
-                .arg("--silent")
-                .current_dir(workspace_root)
-                .output()?,
-        )
-    } else {
-        return Ok(VerifierOutcome {
+/// Run the real build/test command for every project the change touched. This is the
+/// one holistic, layout-agnostic signal — it must run after files are actually on disk
+/// (post-Apply), not while only a proposal exists.
+fn workspace_test_verifier(workspace_root: &str, changed_paths: &[String]) -> VerifierOutcome {
+    let dirs = discover_manifest_dirs(workspace_root, changed_paths);
+    if dirs.is_empty() {
+        return VerifierOutcome {
             verifier: "workspace_test".into(),
             status: VerifierStatus::Skipped,
-            summary: "no built-in workspace test command detected".into(),
-        });
-    };
+            summary: "no recognizable project manifest found".into(),
+        };
+    }
 
-    Ok(VerifierOutcome {
-        verifier: verifier.into(),
-        status: if output.status.success() {
-            VerifierStatus::Passed
-        } else {
-            VerifierStatus::Failed
-        },
-        summary: command_summary(command_label, &output.stdout, &output.stderr),
-    })
-}
+    let mut ran_any = false;
+    let mut failures = Vec::new();
+    for (dir, manifest_name) in &dirs {
+        let Some((build, test)) = build_test_commands(&manifest_kind(manifest_name)) else {
+            continue;
+        };
+        ran_any = true;
+        let label = if dir.is_empty() { "." } else { dir.as_str() };
+        for spec in [build, test] {
+            let outcome = crate::executor::run_command_at(workspace_root, dir, &spec);
+            if !outcome.success {
+                failures.push(format!(
+                    "{} ({label}): {}",
+                    spec.display(),
+                    format_command_outcome(&outcome)
+                ));
+            }
+        }
+    }
 
-fn command_summary(command: &str, stdout: &[u8], stderr: &[u8]) -> String {
-    let stderr_text = String::from_utf8_lossy(stderr);
-    let stdout_text = String::from_utf8_lossy(stdout);
-    let detail = stderr_text
-        .lines()
-        .chain(stdout_text.lines())
-        .map(str::trim)
-        .filter(|line| !line.is_empty())
-        .rev()
-        .take(6)
-        .collect::<Vec<_>>()
-        .into_iter()
-        .rev()
-        .collect::<Vec<_>>()
-        .join(" | ");
+    if !ran_any {
+        return VerifierOutcome {
+            verifier: "workspace_test".into(),
+            status: VerifierStatus::Skipped,
+            summary: format!(
+                "no supported build/test command for detected manifests: {}",
+                dirs.iter()
+                    .map(|(_, name)| name.clone())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+        };
+    }
 
-    if detail.is_empty() {
-        format!("{command}: completed")
+    if failures.is_empty() {
+        VerifierOutcome {
+            verifier: "workspace_test".into(),
+            status: VerifierStatus::Passed,
+            summary: format!("build/test passed in {} project(s)", dirs.len()),
+        }
     } else {
-        format!("{command}: {detail}")
+        VerifierOutcome {
+            verifier: "workspace_test".into(),
+            status: VerifierStatus::Failed,
+            summary: truncate_chars(&failures.join("; "), MAX_REPAIR_OUTPUT_CHARS),
+        }
     }
 }
 
@@ -3200,29 +3358,110 @@ fn auto_resolve_lookup_ambiguities(
     let resolutions = knowledge.resolve_lookup_ambiguities(&lookup_refs);
     let resolved_count = resolutions.len();
 
-    for (id, resolution) in resolutions {
-        tracing::debug!("auto-resolved ambiguity {id}: {resolution}");
-        if let Some(a) = artifact.ambiguities.iter_mut().find(|a| a.id == id) {
+    for resolution in resolutions {
+        tracing::debug!(
+            "auto-resolved ambiguity {}: {}",
+            resolution.ambiguity_id,
+            resolution.resolution
+        );
+        if let Some(a) = artifact
+            .ambiguities
+            .iter_mut()
+            .find(|a| a.id == resolution.ambiguity_id)
+        {
             a.status = AmbiguityStatus::Resolved;
-            a.resolution = Some(resolution.clone());
+            a.resolution = Some(resolution.resolution.clone());
         }
-        // Surface the resolution as a manual evidence entry so the re-run clarify
-        // call sees it as established fact.
-        artifact.manual_evidence.push(shunt_core::ManualEvidence {
-            ecosystem: "registry".into(),
-            package: id.clone(),
-            version: None,
-            version_status: shunt_core::ManualVersionStatus::Unversioned,
-            source: "registry-lookup".into(),
-            locator: String::new(),
-            title: Some("Auto-resolved registry fact".into()),
-            excerpt: resolution,
-            relevance_reason: format!("resolved lookup ambiguity {id}"),
-            confidence: 0.95,
-        });
+        artifact.manual_evidence.push(resolution.evidence);
     }
 
     resolved_count
+}
+
+fn plan_knowledge<P>(
+    provider: &P,
+    artifact: &UnderstandingArtifact,
+) -> RuntimeResult<KnowledgePlanOutput>
+where
+    P: ToolProvider,
+{
+    Ok(KnowledgePlanNode::new(provider).run(artifact)?)
+}
+
+fn apply_planned_knowledge(
+    knowledge: &KnowledgeService,
+    workspace_root: &str,
+    packet: &ContextPacket,
+    artifact: &mut UnderstandingArtifact,
+    plan: KnowledgePlanOutput,
+) -> RuntimeResult<()> {
+    if !plan.should_research || plan.requests.is_empty() {
+        return Ok(());
+    }
+
+    let requests = plan
+        .requests
+        .into_iter()
+        .map(|request| shunt_knowledge::KnowledgeResearchRequest {
+            summary: request.summary,
+            package_hints: request.package_hints,
+            ecosystem_hints: request.ecosystem_hints,
+            search_queries: request.search_queries,
+            source_hints: request.source_hints,
+            freshness_required: request.freshness_required,
+        })
+        .collect::<Vec<_>>();
+    let gathered = knowledge.gather(Path::new(workspace_root), artifact, packet, &requests)?;
+    artifact.manual_evidence = merge_manual_evidence(
+        std::mem::take(&mut artifact.manual_evidence),
+        gathered.manual_evidence,
+    );
+    if artifact.package_facts.is_empty() {
+        artifact.package_facts = gathered.package_facts;
+    }
+    trace_manual_context(artifact);
+    Ok(())
+}
+
+fn merge_manual_evidence(
+    existing: Vec<shunt_core::ManualEvidence>,
+    incoming: Vec<shunt_core::ManualEvidence>,
+) -> Vec<shunt_core::ManualEvidence> {
+    let mut merged = existing;
+    let mut seen = merged
+        .iter()
+        .map(|item| {
+            format!(
+                "{}:{}:{}:{}",
+                item.ecosystem,
+                item.package,
+                item.version.as_deref().unwrap_or(""),
+                item.locator
+            )
+        })
+        .collect::<std::collections::BTreeSet<_>>();
+    for item in incoming {
+        let key = format!(
+            "{}:{}:{}:{}",
+            item.ecosystem,
+            item.package,
+            item.version.as_deref().unwrap_or(""),
+            item.locator
+        );
+        if seen.insert(key) {
+            merged.push(item);
+        }
+    }
+    merged.sort_by(|left, right| right.confidence.total_cmp(&left.confidence));
+    merged
+}
+
+fn research_context_packet(artifact: &UnderstandingArtifact) -> ContextPacket {
+    if artifact.candidate_files.is_empty() {
+        empty_context_packet()
+    } else {
+        build_context_packet_from_scope(&artifact.candidate_files)
+    }
 }
 
 fn observe_workspace_evidence(
@@ -3353,20 +3592,7 @@ fn workspace_profile_evidence(root: &Path) -> Option<EvidenceRef> {
         return None;
     }
 
-    let package_manager = if locks.iter().any(|name| name == "package-lock.json") {
-        Some("npm")
-    } else if locks.iter().any(|name| name == "pnpm-lock.yaml") {
-        Some("pnpm")
-    } else if locks.iter().any(|name| name == "yarn.lock") {
-        Some("yarn")
-    } else {
-        None
-    };
-
     let mut parts = Vec::new();
-    if let Some(package_manager) = package_manager {
-        parts.push(format!("package manager appears to be {package_manager}"));
-    }
     if !manifests.is_empty() {
         parts.push(format!("root manifests: {}", manifests.join(", ")));
     }
@@ -3752,13 +3978,13 @@ mod tests {
         ExecutionStageKind, FileOp, FrontierReason, FrontierStatus, ManualEvidence,
         ManualVersionStatus, PackageFact, PackageVersionProvenance, RecipeRef, RequiredPath,
         RequiredPathIntent, StageStatus, TaskPhase, UncertaintyEvent, UncertaintyKind,
-        VerifierStatus, WorkContract,
+        WorkContract,
     };
-    use shunt_infer::{ToolCall, ToolProvider, ToolSpec};
+    use shunt_infer::{ChatMessage, ToolCall, ToolProvider, ToolSpec};
     use time::OffsetDateTime;
     use time::macros::datetime;
 
-    use super::{ArtifactUpdate, TaskRuntime};
+    use super::{ArtifactUpdate, RuntimeError, TaskRuntime};
     use shunt_store::SqliteStore;
 
     #[test]
@@ -3854,13 +4080,13 @@ mod tests {
             &[
                 super::RepairDiagnostic {
                     source: "setup",
-                    command: Some("pnpm install".into()),
+                    command: Some("setup-tool install".into()),
                     summary: "projected setup command failed".into(),
                     output: "stderr:\nnetwork down".into(),
                 },
                 super::RepairDiagnostic {
                     source: "workspace_check",
-                    command: Some("cargo check --message-format=short --quiet".into()),
+                    command: Some("verify-tool check".into()),
                     summary: "projected workspace check failed".into(),
                     output: "src/lib.rs:1:1: expected item".into(),
                 },
@@ -3869,95 +4095,8 @@ mod tests {
 
         assert!(request.contains("REPAIR DIAGNOSTICS:"));
         assert!(request.contains("source: setup"));
-        assert!(request.contains("command: pnpm install"));
+        assert!(request.contains("command: setup-tool install"));
         assert!(request.contains("expected item"));
-    }
-
-    #[test]
-    fn explicit_literal_coverage_flags_named_file_missing_literal() {
-        let diagnostics = super::explicit_literal_coverage_diagnostics(
-            "Add a `--json` flag and update README.md to mention `--json`.",
-            &ChangeSet {
-                ops: vec![FileOp::Create {
-                    path: "README.md".into(),
-                    contents: "# title\nUsage\n".into(),
-                }],
-                commands: vec![],
-            },
-            &std::collections::HashMap::from([("README.md".into(), "# title\nUsage\n".into())]),
-        );
-
-        assert_eq!(diagnostics.len(), 1);
-        assert_eq!(diagnostics[0].source, "request_literal_coverage");
-        assert!(diagnostics[0].summary.contains("README.md"));
-        assert!(diagnostics[0].output.contains("--json"));
-    }
-
-    #[test]
-    fn structural_file_diagnostics_flags_corrupted_changed_file() {
-        let content =
-            "export function loadUser() {\n  try {\n}\n\nexport function loadUser() {\n}\n";
-        let diagnostics = super::structural_file_diagnostics(
-            &ChangeSet {
-                ops: vec![FileOp::Create {
-                    path: "src/users.ts".into(),
-                    contents: content.into(),
-                }],
-                commands: vec![],
-            },
-            &std::collections::HashMap::from([("src/users.ts".into(), content.into())]),
-        );
-
-        assert_eq!(diagnostics.len(), 1);
-        assert_eq!(diagnostics[0].source, "structure");
-        assert!(diagnostics[0].output.contains("unmatched"));
-        assert!(diagnostics[0].output.contains("function loadUser"));
-    }
-
-    #[test]
-    fn explicit_request_literals_extracts_backticked_content() {
-        let literals = super::explicit_request_literals(
-            "Add `--json` in `src/main.rs` and thread it through `ReportOptions`.",
-        );
-        assert!(literals.contains(&"--json".to_string()));
-        assert!(literals.contains(&"src/main.rs".to_string()));
-        assert!(literals.contains(&"ReportOptions".to_string()));
-    }
-
-    #[test]
-    fn projected_workspace_check_uses_applied_change_set() {
-        let root = unique_temp_dir("projected-workspace-check");
-        fs::create_dir_all(root.join("src")).unwrap();
-        fs::write(
-            root.join("Cargo.toml"),
-            "[package]\nname = \"projected-workspace-check\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
-        )
-        .unwrap();
-        fs::write(root.join("src/lib.rs"), "pub fn ready() -> bool { true }\n").unwrap();
-
-        assert!(super::workspace_check(&root.display().to_string()).is_none());
-
-        let projected = tempfile::tempdir().unwrap();
-        let projected_root = projected.path().join("workspace");
-        super::copy_workspace_tree(&root, &projected_root).unwrap();
-        super::apply_change_set_transactional(
-            &projected_root,
-            &ChangeSet {
-                ops: vec![FileOp::Edit {
-                    path: "src/lib.rs".into(),
-                    search: "pub fn ready() -> bool { true }\n".into(),
-                    replacement: "pub fn ready( -> bool { true }\n".into(),
-                }],
-                commands: vec![],
-            },
-        )
-        .unwrap();
-
-        let projected_failure = super::workspace_check(&projected_root.display().to_string());
-        assert!(projected_failure.is_some());
-        assert!(projected_failure.unwrap().output.contains("src/lib.rs"));
-
-        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
@@ -4160,8 +4299,86 @@ mod tests {
         let prompt = captured_user.lock().unwrap().clone().unwrap();
         assert!(prompt.contains("KNOWLEDGE CONTEXT"));
         assert!(prompt.contains("cargo:ratatui@0.29.0"));
-        assert!(prompt.contains("Exact manual"));
+        assert!(prompt.contains("Prefer this exact guidance"));
         assert!(prompt.contains("Use the Layout API"));
+        assert!(!prompt.contains("manual_evidence:"));
+        assert!(!prompt.contains("package_facts:"));
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn understand_provider_omits_mismatched_knowledge_context() {
+        let root = unique_temp_dir("runtime-knowledge-negative");
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::write(root.join("src/lib.rs"), "pub fn render() {}\n").unwrap();
+
+        let store = SqliteStore::open_in_memory().unwrap();
+        let runtime = TaskRuntime::new(store);
+        let now = datetime!(2026-05-01 12:00 UTC);
+        let (_, mut artifact) = runtime
+            .start_task(
+                now,
+                "task-knowledge-negative",
+                "artifact-knowledge-negative",
+                root.display().to_string(),
+                "fix ratatui layout rendering",
+            )
+            .unwrap();
+        artifact.target_scope = vec!["src/lib.rs".into()];
+        artifact.package_facts = vec![PackageFact {
+            ecosystem: "cargo".into(),
+            name: "ratatui".into(),
+            version: Some("0.29.0".into()),
+            requirement: Some("0.29".into()),
+            version_provenance: PackageVersionProvenance::ExactLock,
+            manifest_path: "Cargo.toml".into(),
+            evidence: vec![],
+            confidence: 0.95,
+        }];
+        artifact.manual_evidence = vec![
+            ManualEvidence {
+                ecosystem: "cargo".into(),
+                package: "ratatui".into(),
+                version: Some("0.28.0".into()),
+                version_status: ManualVersionStatus::Mismatch,
+                source: "manual-catalog".into(),
+                locator: "ratatui/old-layout".into(),
+                title: Some("Old Layout".into()),
+                excerpt: "Outdated layout pattern.".into(),
+                relevance_reason: "mismatch".into(),
+                confidence: 0.99,
+            },
+            ManualEvidence {
+                ecosystem: "cargo".into(),
+                package: "ratatui".into(),
+                version: Some("0.29.0".into()),
+                version_status: ManualVersionStatus::Exact,
+                source: "manual-catalog".into(),
+                locator: "ratatui/layout".into(),
+                title: Some("Layout".into()),
+                excerpt:
+                    "Use Layout::vertical([Constraint::Length(3), Constraint::Min(0)]).split(area)."
+                        .into(),
+                relevance_reason: "exact".into(),
+                confidence: 0.9,
+            },
+        ];
+        runtime.store.put_understanding_artifact(&artifact).unwrap();
+
+        let captured_user = Arc::new(Mutex::new(None));
+        let provider = CapturingUnderstandProvider {
+            captured_user: captured_user.clone(),
+        };
+
+        runtime
+            .understand_task_with_provider("artifact-knowledge-negative", now, &provider)
+            .unwrap();
+
+        let prompt = captured_user.lock().unwrap().clone().unwrap();
+        assert!(prompt.contains("Layout::vertical"));
+        assert!(!prompt.contains("Outdated layout pattern"));
+        assert!(!prompt.contains("Old Layout"));
 
         fs::remove_dir_all(root).unwrap();
     }
@@ -4178,21 +4395,166 @@ mod tests {
             tool: &ToolSpec,
         ) -> shunt_infer::InferResult<ToolCall> {
             *self.captured_user.lock().unwrap() = Some(user.to_string());
-            Ok(ToolCall {
-                name: tool.name.clone(),
-                arguments: serde_json::json!({
+            let arguments = if tool.name == "knowledge_plan" {
+                serde_json::json!({
+                    "should_research": false,
+                    "rationale": "existing knowledge is already attached",
+                    "requests": []
+                })
+            } else {
+                serde_json::json!({
                     "interpreted_goal": "fix ratatui layout rendering",
                     "success_criteria": ["layout rendering is fixed"],
                     "target_scope": ["src/lib.rs"],
                     "ambiguities": [],
                     "risks": [],
                     "confidence": 0.82
-                }),
+                })
+            };
+            Ok(ToolCall {
+                name: tool.name.clone(),
+                arguments,
             })
         }
     }
 
     struct StubProvider;
+
+    struct AskThenDoneProvider {
+        agent_calls: Arc<Mutex<usize>>,
+    }
+
+    impl ToolProvider for AskThenDoneProvider {
+        fn call_tool(
+            &self,
+            _system: &str,
+            user: &str,
+            tool: &ToolSpec,
+        ) -> shunt_infer::InferResult<ToolCall> {
+            let arguments = if tool.name == "knowledge_plan" {
+                serde_json::json!({
+                    "should_research": false,
+                    "rationale": "test fixture",
+                    "requests": []
+                })
+            } else {
+                let mut calls = self.agent_calls.lock().unwrap();
+                *calls += 1;
+                if user.contains("User answered: vite") {
+                    serde_json::json!({
+                        "tool": "done",
+                        "description": "queued vite scaffold",
+                        "setup_commands": [{"command_line": "npm create vite@latest . -- --template react-ts"}]
+                    })
+                } else {
+                    serde_json::json!({
+                        "tool": "ask_user",
+                        "question": "Which React scaffold should I use?",
+                        "context": "Vite is the lightweight React app scaffold; Next.js is a full-stack framework."
+                    })
+                }
+            };
+            Ok(ToolCall {
+                name: tool.name.clone(),
+                arguments,
+            })
+        }
+    }
+
+    struct CapturingClarifyProvider {
+        captured_user: Arc<Mutex<Option<String>>>,
+    }
+
+    impl ToolProvider for CapturingClarifyProvider {
+        fn call_tool(
+            &self,
+            _system: &str,
+            user: &str,
+            tool: &ToolSpec,
+        ) -> shunt_infer::InferResult<ToolCall> {
+            *self.captured_user.lock().unwrap() = Some(user.to_string());
+            let arguments = if tool.name == "knowledge_plan" {
+                serde_json::json!({
+                    "should_research": false,
+                    "rationale": "existing knowledge is already attached",
+                    "requests": []
+                })
+            } else {
+                serde_json::json!({
+                    "interpreted_goal": "fix ratatui layout rendering",
+                    "success_criteria": ["layout rendering is fixed"],
+                    "constraints": [],
+                    "ambiguities": [],
+                    "confidence": 0.82
+                })
+            };
+            Ok(ToolCall {
+                name: tool.name.clone(),
+                arguments,
+            })
+        }
+    }
+
+    #[test]
+    fn clarify_provider_receives_knowledge_context() {
+        let root = unique_temp_dir("runtime-clarify-knowledge-context");
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::write(root.join("src/lib.rs"), "pub fn render() {}\n").unwrap();
+
+        let store = SqliteStore::open_in_memory().unwrap();
+        let runtime = TaskRuntime::new(store);
+        let now = datetime!(2026-05-01 12:00 UTC);
+        let (_, mut artifact) = runtime
+            .start_task(
+                now,
+                "task-clarify-knowledge-context",
+                "artifact-clarify-knowledge-context",
+                root.display().to_string(),
+                "fix ratatui layout rendering",
+            )
+            .unwrap();
+        artifact.package_facts = vec![PackageFact {
+            ecosystem: "cargo".into(),
+            name: "ratatui".into(),
+            version: Some("0.29.0".into()),
+            requirement: Some("0.29".into()),
+            version_provenance: PackageVersionProvenance::ExactLock,
+            manifest_path: "Cargo.toml".into(),
+            evidence: vec![],
+            confidence: 0.95,
+        }];
+        artifact.manual_evidence = vec![ManualEvidence {
+            ecosystem: "cargo".into(),
+            package: "ratatui".into(),
+            version: Some("0.29.0".into()),
+            version_status: ManualVersionStatus::Exact,
+            source: "manual-catalog".into(),
+            locator: "ratatui/layout".into(),
+            title: Some("Layout".into()),
+            excerpt:
+                "Use Layout::vertical([Constraint::Length(3), Constraint::Min(0)]).split(area)."
+                    .into(),
+            relevance_reason: "exact".into(),
+            confidence: 0.9,
+        }];
+        runtime.store.put_understanding_artifact(&artifact).unwrap();
+
+        let captured_user = Arc::new(Mutex::new(None));
+        let provider = CapturingClarifyProvider {
+            captured_user: captured_user.clone(),
+        };
+
+        runtime
+            .clarify_task("artifact-clarify-knowledge-context", now, &provider)
+            .unwrap();
+
+        let prompt = captured_user.lock().unwrap().clone().unwrap();
+        assert!(prompt.contains("KNOWLEDGE CONTEXT"));
+        assert!(prompt.contains("cargo:ratatui@0.29.0"));
+        assert!(prompt.contains("Layout::vertical"));
+
+        fs::remove_dir_all(root).unwrap();
+    }
 
     impl ToolProvider for StubProvider {
         fn call_tool(
@@ -4201,7 +4563,13 @@ mod tests {
             user: &str,
             tool: &ToolSpec,
         ) -> shunt_infer::InferResult<ToolCall> {
-            let value = if tool.name == "understand" || system.contains("understanding node") {
+            let value = if tool.name == "knowledge_plan" {
+                serde_json::json!({
+                    "should_research": false,
+                    "rationale": "repo-backed task; no external research needed",
+                    "requests": []
+                })
+            } else if tool.name == "understand" || system.contains("understanding node") {
                 serde_json::json!({
                     "interpreted_goal": "connect the task, runtime, and store loop in the scoped crates",
                     "success_criteria": ["task state moves through the loop", "artifacts persist locally"],
@@ -4223,10 +4591,11 @@ mod tests {
                     })
                 } else if user.contains("<file path=\"src/lib.rs\">") {
                     serde_json::json!({
-                        "tool": "replace_lines",
+                        "tool": "edit",
                         "path": "src/lib.rs",
                         "start_line": 1,
-                        "end_line": 1
+                        "end_line": 1,
+                        "content": "pub fn marker() -> &'static str { \"after\" }"
                     })
                 } else {
                     serde_json::json!({
@@ -4255,6 +4624,29 @@ mod tests {
             } else {
                 Ok(String::new())
             }
+        }
+
+        // The agent loop uses multi-turn; the task text lives only in the cached
+        // task frame, not the last user message. Join the whole conversation so the
+        // stub's matching sees both the task and the latest tool result.
+        fn call_tool_from_messages(
+            &self,
+            messages: &[ChatMessage],
+            tool: &ToolSpec,
+        ) -> shunt_infer::InferResult<ToolCall> {
+            let system = messages
+                .iter()
+                .filter(|m| m.role == "system")
+                .map(|m| m.content.as_str())
+                .collect::<Vec<_>>()
+                .join("\n");
+            let user = messages
+                .iter()
+                .filter(|m| m.role != "system")
+                .map(|m| m.content.as_str())
+                .collect::<Vec<_>>()
+                .join("\n");
+            self.call_tool(&system, &user, tool)
         }
     }
 
@@ -4337,6 +4729,93 @@ mod tests {
         assert_eq!(task.phase, TaskPhase::Clarify);
 
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn clarify_greenfield_task_can_receive_planned_external_knowledge() {
+        let root = unique_temp_dir("runtime-clarify-greenfield-knowledge");
+        fs::create_dir_all(root.join(".shunt/manuals")).unwrap();
+        fs::write(
+            root.join(".shunt/manuals/catalog.json"),
+            "[{\n  \"ecosystem\": \"npm\",\n  \"package\": \"react\",\n  \"source\": \"manual-catalog\",\n  \"locator\": \"react/install\",\n  \"title\": \"Installation\",\n  \"text\": \"For new React apps, use a framework or create-vite instead of installing react alone.\",\n  \"keywords\": [\"react\", \"install\", \"vite\"]\n}]\n",
+        )
+        .unwrap();
+
+        let store = SqliteStore::open_in_memory().unwrap();
+        let runtime = TaskRuntime::new(store);
+        let now = datetime!(2026-05-01 12:00 UTC);
+        runtime
+            .start_task(
+                now,
+                "task-greenfield-knowledge",
+                "artifact-greenfield-knowledge",
+                root.display().to_string(),
+                "what is the current recommended installation path for react?",
+            )
+            .unwrap();
+
+        let captured_user = Arc::new(Mutex::new(None));
+        let provider = PlanningClarifyProvider {
+            captured_user: captured_user.clone(),
+        };
+
+        let artifact = runtime
+            .clarify_task("artifact-greenfield-knowledge", now, &provider)
+            .unwrap()
+            .unwrap();
+
+        let prompt = captured_user.lock().unwrap().clone().unwrap();
+        assert!(prompt.contains("KNOWLEDGE CONTEXT"));
+        assert!(prompt.contains("npm:react@unknown"));
+        assert!(
+            artifact
+                .manual_evidence
+                .iter()
+                .any(|manual| manual.package == "react" && manual.excerpt.contains("create-vite"))
+        );
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    struct PlanningClarifyProvider {
+        captured_user: Arc<Mutex<Option<String>>>,
+    }
+
+    impl ToolProvider for PlanningClarifyProvider {
+        fn call_tool(
+            &self,
+            _system: &str,
+            user: &str,
+            tool: &ToolSpec,
+        ) -> shunt_infer::InferResult<ToolCall> {
+            *self.captured_user.lock().unwrap() = Some(user.to_string());
+            let arguments = if tool.name == "knowledge_plan" {
+                serde_json::json!({
+                    "should_research": true,
+                    "rationale": "greenfield request needs current installation guidance",
+                    "requests": [{
+                        "summary": "Current recommended React installation path for a new project",
+                        "package_hints": ["react"],
+                        "ecosystem_hints": ["npm"],
+                        "search_queries": ["current recommended installation path for react"],
+                        "source_hints": ["official docs", "public tutorials"],
+                        "freshness_required": true
+                    }]
+                })
+            } else {
+                serde_json::json!({
+                    "interpreted_goal": "recommend the current React installation path",
+                    "success_criteria": ["the answer reflects current React installation guidance"],
+                    "constraints": [],
+                    "ambiguities": [],
+                    "confidence": 0.8
+                })
+            };
+            Ok(ToolCall {
+                name: tool.name.clone(),
+                arguments,
+            })
+        }
     }
 
     #[test]
@@ -4642,7 +5121,7 @@ mod tests {
     }
 
     #[test]
-    fn verify_stage_runs_workspace_checks() {
+    fn verify_stage_passes_on_approved_artifact_without_running_build() {
         let root = unique_temp_dir("frame-verify");
         fs::create_dir_all(root.join("src")).unwrap();
         fs::write(
@@ -4708,12 +5187,13 @@ mod tests {
 
         assert_eq!(verify_stage.status, StageStatus::Passed);
         assert_eq!(recipe_run.current_stage, ExecutionStageKind::Apply);
+        // Verify gates the plan (approval/evidence/ambiguity), not the applied result —
+        // nothing has been written to disk yet, so it must not attempt a build here.
         assert!(
-            verify_stage
+            !verify_stage
                 .verifiers
                 .iter()
-                .any(|verifier| verifier.verifier == "cargo_test"
-                    && verifier.status == VerifierStatus::Passed)
+                .any(|verifier| verifier.verifier == "workspace_test")
         );
 
         fs::remove_dir_all(root).unwrap();
@@ -4894,111 +5374,6 @@ mod tests {
     }
 
     #[test]
-    fn validate_failure_creates_frontier_case() {
-        let root = unique_temp_dir("frame-validate-failure");
-        fs::create_dir_all(root.join("src")).unwrap();
-        fs::write(
-            root.join("Cargo.toml"),
-            "[package]\nname = \"frame-validate-failure\"\nversion = \"0.1.0\"\nedition = \"2024\"\n",
-        )
-        .unwrap();
-        fs::write(
-            root.join("src/lib.rs"),
-            "pub fn marker() -> &'static str { \"before\" }\n",
-        )
-        .unwrap();
-
-        let store = SqliteStore::open_in_memory().unwrap();
-        let runtime = TaskRuntime::new(store);
-        let now = datetime!(2026-05-01 12:00 UTC);
-
-        runtime
-            .start_task(
-                now,
-                "task-1",
-                "artifact-1",
-                root.display().to_string(),
-                "apply one bounded change",
-            )
-            .unwrap();
-        runtime
-            .revise_artifact(
-                "artifact-1",
-                now,
-                ArtifactUpdate {
-                    evidence: Some(vec![EvidenceRef {
-                        kind: EvidenceKind::File,
-                        locator: "src/lib.rs".into(),
-                        summary: "source file exists".into(),
-                    }]),
-                    candidate_files: Some(vec![CandidateFile {
-                        path: "src/lib.rs".into(),
-                        summary: "validate candidate".into(),
-                    }]),
-                    ..Default::default()
-                },
-            )
-            .unwrap();
-        runtime
-            .approve_artifact("artifact-1", "user", Some("approved".into()), now)
-            .unwrap();
-        runtime
-            .start_execution(
-                "task-1",
-                now,
-                RecipeRef {
-                    id: "manual.inspect-propose".into(),
-                    version: "v1".into(),
-                },
-            )
-            .unwrap();
-        runtime.execute_inspect("task-1", now).unwrap();
-        runtime.execute_propose("task-1", now).unwrap();
-        runtime.execute_verify("task-1", now).unwrap();
-        runtime
-            .set_change_set(
-                "task-1",
-                now,
-                ChangeSet {
-                    ops: vec![FileOp::Create {
-                        path: "src/lib.rs".into(),
-                        contents: "pub fn marker() -> &'static str { invalid }\n".into(),
-                    }],
-                    commands: vec![],
-                },
-            )
-            .unwrap();
-        runtime.execute_apply("task-1", now).unwrap();
-
-        let recipe_run = runtime.execute_validate("task-1", now).unwrap();
-        let validate_stage = recipe_run
-            .stages
-            .iter()
-            .find(|stage| stage.kind == ExecutionStageKind::Validate)
-            .unwrap();
-
-        assert_eq!(validate_stage.status, StageStatus::Failed);
-
-        let store = runtime.into_store();
-        let task = store.get_task_run("task-1").unwrap().unwrap();
-        let frontier_cases = store.list_frontier_cases_for_task("task-1").unwrap();
-
-        assert_eq!(task.phase, TaskPhase::Execute);
-        assert_eq!(task.frontier_cases.len(), 1);
-        assert_eq!(frontier_cases.len(), 1);
-        assert_eq!(frontier_cases[0].reason, FrontierReason::VerifierFailure);
-        assert_eq!(frontier_cases[0].recipe_run_id, Some(recipe_run.id.clone()));
-        assert!(
-            frontier_cases[0]
-                .uncertainty_events
-                .iter()
-                .any(|event| event.kind == UncertaintyKind::VerifierFailure)
-        );
-
-        fs::remove_dir_all(root).unwrap();
-    }
-
-    #[test]
     fn patch_correction_replays_failed_validate_run() {
         let root = unique_temp_dir("frame-correction-replay");
         fs::create_dir_all(root.join("src")).unwrap();
@@ -5067,7 +5442,7 @@ mod tests {
                 ChangeSet {
                     ops: vec![FileOp::Create {
                         path: "src/lib.rs".into(),
-                        contents: "pub fn marker() -> &'static str { invalid }\n".into(),
+                        contents: "pub fn marker() -> &'static str { \"intermediate\" }\n".into(),
                     }],
                     commands: vec![],
                 },
@@ -5076,13 +5451,30 @@ mod tests {
         runtime.execute_apply("task-1", now).unwrap();
         runtime.execute_validate("task-1", now).unwrap();
 
-        let store = runtime.into_store();
-        let frontier_case = store
-            .list_frontier_cases_for_task("task-1")
+        let task = runtime.store.get_task_run("task-1").unwrap().unwrap();
+        let artifact = runtime
+            .store
+            .get_understanding_artifact("artifact-1")
             .unwrap()
-            .pop()
             .unwrap();
-        let runtime = TaskRuntime::new(store);
+        let frontier_case = runtime
+            .record_frontier_case(
+                now,
+                "frontier-1",
+                &task,
+                &artifact,
+                FrontierReason::VerifierFailure,
+                "explicit validation failure",
+                vec![UncertaintyEvent {
+                    task_id: task.id.clone(),
+                    stage: Some(ExecutionStageKind::Validate),
+                    kind: UncertaintyKind::VerifierFailure,
+                    summary: "explicitly seeded correction frontier".into(),
+                    confidence: None,
+                    created_at: now,
+                }],
+            )
+            .unwrap();
 
         let (correction, frontier_case, recipe_run) = runtime
             .create_patch_correction(
@@ -5199,6 +5591,58 @@ mod tests {
         assert_eq!(path, "src/lib.rs");
         assert!(contents.contains("\"after\""));
         assert_eq!(recipe_run.current_stage, ExecutionStageKind::Apply);
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn agent_question_answer_resumes_persisted_agent_pause() {
+        let root = unique_temp_dir("runtime-agent-pause-resume");
+        fs::create_dir_all(&root).unwrap();
+        let store = SqliteStore::open_in_memory().unwrap();
+        let runtime = TaskRuntime::new(store);
+        let now = datetime!(2026-05-01 12:00 UTC);
+        runtime
+            .start_task(
+                now,
+                "task-agent-pause",
+                "artifact-agent-pause",
+                root.display().to_string(),
+                "install latest react boilerplate",
+            )
+            .unwrap();
+
+        let provider = AskThenDoneProvider {
+            agent_calls: Arc::new(Mutex::new(0)),
+        };
+        let err = runtime
+            .generate_proposed_change("task-agent-pause", now, &provider, &[], &[])
+            .unwrap_err();
+        assert!(matches!(err, RuntimeError::AgentNeedsClarification { .. }));
+        assert!(
+            runtime
+                .store
+                .get_agent_pause::<shunt_infer::AgentPauseState>("task-agent-pause")
+                .unwrap()
+                .is_some()
+        );
+
+        let recipe_run = runtime
+            .resume_agent("task-agent-pause", now, &provider, "vite", &[])
+            .unwrap();
+        assert!(
+            runtime
+                .store
+                .get_agent_pause::<shunt_infer::AgentPauseState>("task-agent-pause")
+                .unwrap()
+                .is_none()
+        );
+        let cs = recipe_run
+            .change_set
+            .expect("resume should store change set");
+        assert_eq!(cs.ops.len(), 0);
+        assert_eq!(cs.commands.len(), 1);
+        assert_eq!(cs.commands[0].program, "npm");
 
         fs::remove_dir_all(root).unwrap();
     }

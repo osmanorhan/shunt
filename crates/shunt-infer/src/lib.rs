@@ -3,8 +3,8 @@ pub mod engine;
 pub mod registry;
 
 pub use agent::{
-    AgentObserver, AgentResult, AgentSession, AgentTurn, DEFAULT_IGNORE_PATTERNS, SessionBudget,
-    SessionBudgetOverride,
+    AgentObserver, AgentPauseState, AgentResult, AgentSession, AgentTurn, CriterionOutcome,
+    DEFAULT_IGNORE_PATTERNS, KnowledgeLookup, SessionBudget, SessionBudgetOverride,
 };
 
 use reqwest::blocking::Client;
@@ -50,10 +50,12 @@ pub const MAX_RETRIES: usize = 3;
 
 static NEXT_CALL_ID: AtomicU64 = AtomicU64::new(1);
 
-/// Cap on reasoning tokens for grammar tool-decision calls. The model reasons in
-/// `reasoning_content` (discarded) then emits a short valid action; this bounds
-/// how long it ruminates per turn. Content calls (`call_text`) disable thinking
-/// entirely instead.
+/// Fallback reasoning-token cap for tool-decision calls on models that expose no
+/// thinking budget of their own. Models that DO declare `thinking_budget_tokens`
+/// (e.g. Gemma-4 at 2048) govern themselves — a smaller hardcoded cap would
+/// guillotine the thought channel mid-stream, forcing the model to reopen a
+/// `<|channel>thought` block *after* the tool call and re-emit, which puts the raw
+/// generation out of gemma's grammar order and makes llama.cpp's peg parser 500.
 const AGENT_REASONING_BUDGET: i32 = 384;
 
 #[derive(Debug, Clone)]
@@ -285,6 +287,12 @@ pub struct OpenAiCompatProvider {
     call_timeout: Duration,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum OpenAiTransport {
+    #[default]
+    ChatCompletions,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum ToolChoiceMode {
@@ -302,6 +310,9 @@ pub enum ToolChoiceMode {
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct ProviderCapabilities {
+    pub preferred_transport: OpenAiTransport,
+    pub supports_chat_completions_tools: bool,
+    pub supports_chat_completions_json_schema: bool,
     pub tool_choice_mode: ToolChoiceMode,
     /// Total token budget per call (thinking tokens + output tokens).
     pub max_tokens: u32,
@@ -326,6 +337,9 @@ pub struct ProviderCapabilities {
 impl Default for ProviderCapabilities {
     fn default() -> Self {
         Self {
+            preferred_transport: OpenAiTransport::ChatCompletions,
+            supports_chat_completions_tools: true,
+            supports_chat_completions_json_schema: true,
             tool_choice_mode: ToolChoiceMode::RequiredString,
             max_tokens: 32768,
             disable_thinking: false,
@@ -372,26 +386,29 @@ impl ProviderCapabilities {
     ///
     /// Resolution order:
     /// 1. Look up the model family in the built-in registry.
-    /// 2. Apply engine-specific overrides (e.g., Ollama native always uses JsonSchema).
+    /// 2. Use the single OpenAI-compatible path: chat-completions function tools.
     pub fn detect(model_id: &str, endpoint: &str) -> Self {
         use engine::{EngineKind, detect_engine};
         use registry::ModelRegistry;
-        let profile = ModelRegistry::with_defaults().resolve(model_id);
         let engine = detect_engine(endpoint);
-        // Ollama's /v1 shim supports tool_choice but the native /api/chat uses format field.
-        // When the model itself prefers JsonSchema, keep it; otherwise let it pass through.
-        let tool_choice_mode = if engine == EngineKind::Ollama
-            && profile.tool_choice_mode == ToolChoiceMode::RequiredString
+        let profile = ModelRegistry::with_defaults().resolve(model_id);
+        let (supports_chat_completions_tools, supports_chat_completions_json_schema) = match engine
         {
-            ToolChoiceMode::RequiredString
-        } else {
-            profile.tool_choice_mode
+            EngineKind::Ollama => (true, true),
+            EngineKind::LlamaCpp => (true, true),
+            EngineKind::Vllm => (true, true),
+            EngineKind::Generic => (true, true),
         };
+        let tool_choice_mode = ToolChoiceMode::RequiredString;
+        let preferred_transport = OpenAiTransport::ChatCompletions;
         Self {
+            preferred_transport,
+            supports_chat_completions_tools,
+            supports_chat_completions_json_schema,
             tool_choice_mode,
             max_tokens: profile.max_tokens,
-            disable_thinking: profile.disable_thinking,
-            thinking_budget_tokens: profile.thinking_budget_tokens,
+            disable_thinking: false,
+            thinking_budget_tokens: None,
             temperature: profile.temperature,
             content_temperature: profile.content_temperature,
             top_p: profile.top_p,
@@ -399,7 +416,7 @@ impl ProviderCapabilities {
             min_p: profile.min_p,
             presence_penalty: profile.presence_penalty,
             repetition_penalty: profile.repetition_penalty,
-            suppress_content_thinking: profile.suppress_content_thinking,
+            suppress_content_thinking: false,
         }
     }
 }
@@ -442,92 +459,35 @@ impl OpenAiCompatProvider {
         } else {
             user.to_owned()
         };
-        if self.capabilities.tool_choice_mode == ToolChoiceMode::JsonSchema {
-            // Grammar-based constrained decoding: no tools, response_format carries
-            // the schema.  The model is forced to emit content that exactly matches
-            // the JSON schema.  Best for thinking models that ignore tool_choice.
-            return ChatCompletionRequest {
-                model: self.model.clone(),
-                messages: vec![
-                    ChatMessage {
-                        role: "system".into(),
-                        content: system.into(),
-                    },
-                    ChatMessage {
-                        role: "user".into(),
-                        content: user_content.clone(),
-                    },
-                ],
-                temperature: Some(self.capabilities.temperature),
-                max_tokens: action_schema_max_tokens(&tool.parameters),
-                top_p: self.capabilities.top_p,
-                top_k: self.capabilities.top_k,
-                min_p: self.capabilities.min_p,
-                presence_penalty: self.capabilities.presence_penalty,
-                repetition_penalty: self.capabilities.repetition_penalty,
-                tools: vec![],
-                tool_choice: None,
-                response_format: Some(serde_json::json!({
-                    "type": "json_schema",
-                    "json_schema": {
-                        "name": &tool.name,
-                        "strict": true,
-                        "schema": tool.parameters
-                    }
-                })),
-                stream: None,
-                budget_tokens: None,
-                cache_prompt: Some(true),
-                chat_template_kwargs: Some(serde_json::json!({ "enable_thinking": false })),
-                reasoning_budget: None,
-            };
-        }
-
-        let tool_def = OaiToolDefinition {
-            type_: "function".into(),
-            function: OaiToolFunction {
-                name: tool.name.clone(),
-                description: tool.description.clone(),
-                parameters: tool.parameters.clone(),
-            },
-        };
-        let tool_choice = match self.capabilities.tool_choice_mode {
-            ToolChoiceMode::NamedObject => Some(serde_json::json!({
-                "type": "function",
-                "function": {"name": &tool.name}
-            })),
-            ToolChoiceMode::RequiredString => Some(serde_json::json!("required")),
-            ToolChoiceMode::AutoString => Some(serde_json::json!("auto")),
-            ToolChoiceMode::Omit | ToolChoiceMode::JsonSchema => None,
-        };
+        let tool_defs = openai_tool_definitions(tool);
+        let tool_choice = Some(serde_json::json!("required"));
 
         ChatCompletionRequest {
             model: self.model.clone(),
             messages: vec![
-                ChatMessage {
-                    role: "system".into(),
-                    content: system.into(),
-                },
-                ChatMessage {
-                    role: "user".into(),
-                    content: user_content,
-                },
+                chat_message("system", system),
+                chat_message("user", &user_content),
             ],
             temperature: Some(self.capabilities.temperature),
-            max_tokens: 8192,
+            max_tokens: self.capabilities.max_tokens,
             top_p: self.capabilities.top_p,
             top_k: self.capabilities.top_k,
             min_p: self.capabilities.min_p,
             presence_penalty: self.capabilities.presence_penalty,
             repetition_penalty: self.capabilities.repetition_penalty,
-            tools: vec![tool_def],
+            tools: tool_defs,
             tool_choice,
             response_format: None,
             stream: None,
             budget_tokens: self.capabilities.thinking_budget_tokens,
             cache_prompt: Some(true),
             chat_template_kwargs: None,
-            reasoning_budget: Some(AGENT_REASONING_BUDGET),
+            reasoning_budget: Some(
+                self.capabilities
+                    .thinking_budget_tokens
+                    .map(|b| b as i32)
+                    .unwrap_or(AGENT_REASONING_BUDGET),
+            ),
         }
     }
 
@@ -550,70 +510,31 @@ impl OpenAiCompatProvider {
             v
         };
 
-        if self.capabilities.tool_choice_mode == ToolChoiceMode::JsonSchema {
-            return ChatCompletionRequest {
-                model: self.model.clone(),
-                messages: processed,
-                temperature: Some(self.capabilities.temperature),
-                max_tokens: action_schema_max_tokens(&tool.parameters),
-                top_p: self.capabilities.top_p,
-                top_k: self.capabilities.top_k,
-                min_p: self.capabilities.min_p,
-                presence_penalty: self.capabilities.presence_penalty,
-                repetition_penalty: self.capabilities.repetition_penalty,
-                tools: vec![],
-                tool_choice: None,
-                response_format: Some(serde_json::json!({
-                    "type": "json_schema",
-                    "json_schema": {
-                        "name": &tool.name,
-                        "strict": true,
-                        "schema": tool.parameters
-                    }
-                })),
-                stream: None,
-                budget_tokens: None,
-                cache_prompt: Some(true),
-                chat_template_kwargs: Some(serde_json::json!({ "enable_thinking": false })),
-                reasoning_budget: None,
-            };
-        }
-
-        let tool_def = OaiToolDefinition {
-            type_: "function".into(),
-            function: OaiToolFunction {
-                name: tool.name.clone(),
-                description: tool.description.clone(),
-                parameters: tool.parameters.clone(),
-            },
-        };
-        let tool_choice = match self.capabilities.tool_choice_mode {
-            ToolChoiceMode::NamedObject => Some(serde_json::json!({
-                "type": "function",
-                "function": {"name": &tool.name}
-            })),
-            ToolChoiceMode::RequiredString => Some(serde_json::json!("required")),
-            ToolChoiceMode::AutoString => Some(serde_json::json!("auto")),
-            ToolChoiceMode::Omit | ToolChoiceMode::JsonSchema => None,
-        };
+        let tool_defs = openai_tool_definitions(tool);
+        let tool_choice = Some(serde_json::json!("required"));
         ChatCompletionRequest {
             model: self.model.clone(),
-            messages: processed,
+            messages: native_chat_messages(&processed, tool),
             temperature: Some(self.capabilities.temperature),
-            max_tokens: 8192,
+            max_tokens: self.capabilities.max_tokens,
             top_p: self.capabilities.top_p,
             top_k: self.capabilities.top_k,
             min_p: self.capabilities.min_p,
             presence_penalty: self.capabilities.presence_penalty,
             repetition_penalty: self.capabilities.repetition_penalty,
-            tools: vec![tool_def],
+            tools: tool_defs,
             tool_choice,
             response_format: None,
             stream: None,
             budget_tokens: self.capabilities.thinking_budget_tokens,
             cache_prompt: Some(true),
             chat_template_kwargs: None,
-            reasoning_budget: Some(AGENT_REASONING_BUDGET),
+            reasoning_budget: Some(
+                self.capabilities
+                    .thinking_budget_tokens
+                    .map(|b| b as i32)
+                    .unwrap_or(AGENT_REASONING_BUDGET),
+            ),
         }
     }
 
@@ -633,14 +554,19 @@ impl OpenAiCompatProvider {
         &self,
         req: &ChatCompletionRequest,
     ) -> InferResult<T> {
+        self.post_json("/v1/chat/completions", req)
+    }
+
+    fn post_json<T: DeserializeOwned + Send + 'static, S: Serialize>(
+        &self,
+        path: &str,
+        req: &S,
+    ) -> InferResult<T> {
         let body = serde_json::to_vec(req).map_err(InferError::Json)?;
         tracing::debug!("── request body ──\n{}", String::from_utf8_lossy(&body));
         let client = self.client.clone();
         let deadline = self.call_timeout;
-        let url = format!(
-            "{}/v1/chat/completions",
-            self.endpoint.trim_end_matches('/')
-        );
+        let url = format!("{}{}", self.endpoint.trim_end_matches('/'), path);
         let (tx, rx) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
             // Per-request timeout = the deadline, so a timed-out request is
@@ -695,17 +621,11 @@ impl OpenAiCompatProvider {
         let req = ChatCompletionRequest {
             model: self.model.clone(),
             messages: vec![
-                ChatMessage {
-                    role: "system".into(),
-                    content: system.into(),
-                },
-                ChatMessage {
-                    role: "user".into(),
-                    content: user_content,
-                },
+                chat_message("system", system),
+                chat_message("user", &user_content),
             ],
             temperature: Some(content_temp),
-            max_tokens: 8192,
+            max_tokens: self.capabilities.max_tokens,
             top_p: self.capabilities.top_p,
             top_k: self.capabilities.top_k,
             min_p: self.capabilities.min_p,
@@ -747,33 +667,8 @@ impl OpenAiCompatProvider {
         );
         Ok(content)
     }
-}
 
-impl ToolProvider for OpenAiCompatProvider {
-    fn capabilities(&self) -> ProviderCapabilities {
-        self.capabilities
-    }
-
-    fn generate_text(&self, system: &str, user: &str) -> InferResult<String> {
-        // For thinking models (JsonSchema mode: Gemma-4, Gemma-3, Qwen3, DeepSeek-R1),
-        // use call_text directly. Reasoning tokens come in delta.reasoning_content (skipped)
-        // and the actual file content comes in delta.content (captured).
-        //
-        // Note: a grammar-wrapper approach (wrap output in {"output":"..."}) does NOT work
-        // for Gemma-4-IT because the model exhausts the token budget on reasoning BEFORE
-        // the JSON content can be generated, resulting in an empty response.
-        //
-        // For non-thinking models, also use call_text (already the fallback).
-        self.call_text(system, user)
-    }
-
-    fn with_call_observer(&self, observer: ModelCallObserver) -> Self {
-        let mut provider = self.clone();
-        provider.observer = Some(observer);
-        provider
-    }
-
-    fn call_tool(&self, system: &str, user: &str, tool: &ToolSpec) -> InferResult<ToolCall> {
+    fn call_tool_chat(&self, system: &str, user: &str, tool: &ToolSpec) -> InferResult<ToolCall> {
         tracing::debug!(
             "\n═══ CALL_TOOL ═══  model={}  endpoint={}\n\
              ── tool: {} ──\n\
@@ -797,9 +692,6 @@ impl ToolProvider for OpenAiCompatProvider {
             mode: format!("{:?}", self.capabilities.tool_choice_mode),
         });
 
-        // Stateless, non-streaming call. Non-streaming is deliberate: the manual
-        // SSE read had no idle timeout (a stalled stream hung forever), and one
-        // request is bounded by the client timeout and parsed whole.
         let mut req = self.request_for(system, user, tool);
         req.stream = Some(false);
 
@@ -815,78 +707,10 @@ impl ToolProvider for OpenAiCompatProvider {
                 return Err(err);
             }
         };
-        let elapsed_ms = started.elapsed().as_millis() as u64;
-        let message = resp.choices.into_iter().next().map(|c| c.message);
-
-        // Tool-calling mode emits structured `tool_calls`; grammar/JsonSchema mode
-        // emits the tool-call JSON in `content`. Both resolve to (name, args_json).
-        let (actual_tool, args_str) = if let Some(tc) = message
-            .as_ref()
-            .and_then(|m| m.tool_calls.as_ref())
-            .and_then(|calls| calls.first())
-        {
-            (tc.function.name.clone(), tc.function.arguments.clone())
-        } else if let Some(content) = message
-            .as_ref()
-            .and_then(|m| m.content.as_deref())
-            .map(str::trim)
-            .filter(|c| !c.is_empty())
-        {
-            (tool.name.clone(), extract_json_object(content))
-        } else {
-            self.emit(ModelCallEvent::Finished {
-                call_id,
-                tool: tool.name.clone(),
-                elapsed_ms,
-                outcome: "empty_response".into(),
-            });
-            return Err(InferError::EmptyResponse);
-        };
-
-        tracing::debug!("call_tool result for {actual_tool}: {args_str}");
-
-        if actual_tool != tool.name {
-            self.emit(ModelCallEvent::Finished {
-                call_id,
-                tool: tool.name.clone(),
-                elapsed_ms,
-                outcome: format!("unexpected_tool: {actual_tool}"),
-            });
-            return Err(InferError::UnexpectedTool {
-                expected: tool.name.clone(),
-                actual: actual_tool,
-            });
-        }
-
-        let arguments: serde_json::Value = match serde_json::from_str(&args_str) {
-            Ok(v) => v,
-            Err(err) => {
-                self.emit(ModelCallEvent::Finished {
-                    call_id,
-                    tool: tool.name.clone(),
-                    elapsed_ms,
-                    outcome: format!("invalid_json: {err}"),
-                });
-                return Err(InferError::Json(err));
-            }
-        };
-
-        self.emit(ModelCallEvent::Finished {
-            call_id,
-            tool: tool.name.clone(),
-            elapsed_ms,
-            outcome: "tool_call".into(),
-        });
-        Ok(ToolCall {
-            name: actual_tool,
-            arguments,
-        })
+        self.finish_chat_tool_call(call_id, started, tool, resp, false)
     }
 
-    /// Multi-turn override: passes the full conversation history to the server.
-    /// The stable prefix (system + prior turns) is KV-cached by llama.cpp so only
-    /// the new last message needs fresh prefill, cutting per-turn cost significantly.
-    fn call_tool_from_messages(
+    fn call_tool_chat_from_messages(
         &self,
         messages: &[ChatMessage],
         tool: &ToolSpec,
@@ -919,24 +743,55 @@ impl ToolProvider for OpenAiCompatProvider {
                 return Err(err);
             }
         };
+        self.finish_chat_tool_call(call_id, started, tool, resp, true)
+    }
 
+    fn finish_chat_tool_call(
+        &self,
+        call_id: u64,
+        started: Instant,
+        tool: &ToolSpec,
+        resp: ChatCompletionResponse,
+        from_history: bool,
+    ) -> InferResult<ToolCall> {
         let elapsed_ms = started.elapsed().as_millis() as u64;
-        let message = resp.choices.into_iter().next().map(|c| c.message);
+        let normalized = match normalize_chat_completion_message(
+            resp.choices.into_iter().next().map(|c| c.message),
+            &tool.name,
+            self.capabilities.tool_choice_mode,
+        ) {
+            Ok(output) => output,
+            Err(InferError::EmptyResponse) => {
+                self.emit(ModelCallEvent::Finished {
+                    call_id,
+                    tool: tool.name.clone(),
+                    elapsed_ms,
+                    outcome: "empty_response".into(),
+                });
+                return Err(InferError::EmptyResponse);
+            }
+            Err(err) => {
+                self.emit(ModelCallEvent::Finished {
+                    call_id,
+                    tool: tool.name.clone(),
+                    elapsed_ms,
+                    outcome: format!("parse_failed: {err}"),
+                });
+                return Err(err);
+            }
+        };
+        self.finish_normalized_tool_call(call_id, elapsed_ms, tool, normalized, from_history)
+    }
 
-        let (actual_tool, args_str) = if let Some(tc) = message
-            .as_ref()
-            .and_then(|m| m.tool_calls.as_ref())
-            .and_then(|calls| calls.first())
-        {
-            (tc.function.name.clone(), tc.function.arguments.clone())
-        } else if let Some(content) = message
-            .as_ref()
-            .and_then(|m| m.content.as_deref())
-            .map(str::trim)
-            .filter(|c| !c.is_empty())
-        {
-            (tool.name.clone(), extract_json_object(content))
-        } else {
+    fn finish_normalized_tool_call(
+        &self,
+        call_id: u64,
+        elapsed_ms: u64,
+        tool: &ToolSpec,
+        normalized: NormalizedAssistantOutput,
+        from_history: bool,
+    ) -> InferResult<ToolCall> {
+        let Some(tool_call) = normalized.tool_call else {
             self.emit(ModelCallEvent::Finished {
                 call_id,
                 tool: tool.name.clone(),
@@ -946,7 +801,20 @@ impl ToolProvider for OpenAiCompatProvider {
             return Err(InferError::EmptyResponse);
         };
 
-        if actual_tool != tool.name {
+        let actual_tool = tool_call.name;
+        let args_str = tool_call.arguments_json;
+        tracing::debug!("call_tool result for {actual_tool}: {args_str}");
+
+        let (returned_tool_name, args_str) = if tool.name == "agent_action" {
+            (
+                tool.name.clone(),
+                agent_action_arguments(&actual_tool, &args_str)?,
+            )
+        } else {
+            (actual_tool.clone(), args_str)
+        };
+
+        if returned_tool_name != tool.name {
             self.emit(ModelCallEvent::Finished {
                 call_id,
                 tool: tool.name.clone(),
@@ -955,7 +823,7 @@ impl ToolProvider for OpenAiCompatProvider {
             });
             return Err(InferError::UnexpectedTool {
                 expected: tool.name.clone(),
-                actual: actual_tool,
+                actual: returned_tool_name,
             });
         }
 
@@ -976,12 +844,47 @@ impl ToolProvider for OpenAiCompatProvider {
             call_id,
             tool: tool.name.clone(),
             elapsed_ms,
-            outcome: "tool_call_history".into(),
+            outcome: if from_history {
+                "tool_call_history".into()
+            } else {
+                "tool_call".into()
+            },
         });
         Ok(ToolCall {
-            name: actual_tool,
+            name: returned_tool_name,
             arguments,
         })
+    }
+}
+
+impl ToolProvider for OpenAiCompatProvider {
+    fn capabilities(&self) -> ProviderCapabilities {
+        self.capabilities
+    }
+
+    fn generate_text(&self, system: &str, user: &str) -> InferResult<String> {
+        self.call_text(system, user)
+    }
+
+    fn with_call_observer(&self, observer: ModelCallObserver) -> Self {
+        let mut provider = self.clone();
+        provider.observer = Some(observer);
+        provider
+    }
+
+    fn call_tool(&self, system: &str, user: &str, tool: &ToolSpec) -> InferResult<ToolCall> {
+        self.call_tool_chat(system, user, tool)
+    }
+
+    /// Multi-turn override: passes the full conversation history to the server.
+    /// The stable prefix (system + prior turns) is KV-cached by llama.cpp so only
+    /// the new last message needs fresh prefill, cutting per-turn cost significantly.
+    fn call_tool_from_messages(
+        &self,
+        messages: &[ChatMessage],
+        tool: &ToolSpec,
+    ) -> InferResult<ToolCall> {
+        self.call_tool_chat_from_messages(messages, tool)
     }
 }
 
@@ -1160,6 +1063,10 @@ pub struct ClarifyNode<'a, P> {
     agent_context: Option<String>,
 }
 
+pub struct KnowledgePlanNode<'a, P> {
+    provider: &'a P,
+}
+
 impl<'a, P> ClarifyNode<'a, P>
 where
     P: ToolProvider,
@@ -1184,6 +1091,26 @@ where
             "clarify",
             clarify_system_prompt(),
             &clarify_user_prompt(artifact, self.agent_context.as_deref()),
+            &schema,
+        )
+    }
+}
+
+impl<'a, P> KnowledgePlanNode<'a, P>
+where
+    P: ToolProvider,
+{
+    pub fn new(provider: &'a P) -> Self {
+        Self { provider }
+    }
+
+    pub fn run(&self, artifact: &UnderstandingArtifact) -> InferResult<KnowledgePlanOutput> {
+        let schema =
+            serde_json::to_value(schemars::schema_for!(KnowledgePlanOutput)).unwrap_or_default();
+        self.provider.generate_structured_named(
+            "knowledge_plan",
+            knowledge_plan_system_prompt(),
+            &knowledge_plan_user_prompt(artifact),
             &schema,
         )
     }
@@ -1285,6 +1212,30 @@ pub struct UnderstandOutput {
     pub confidence: f32,
 }
 
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct KnowledgePlanOutput {
+    pub should_research: bool,
+    #[serde(default)]
+    pub rationale: String,
+    #[serde(default)]
+    pub requests: Vec<KnowledgePlanRequest>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct KnowledgePlanRequest {
+    pub summary: String,
+    #[serde(default)]
+    pub package_hints: Vec<String>,
+    #[serde(default)]
+    pub ecosystem_hints: Vec<String>,
+    #[serde(default)]
+    pub search_queries: Vec<String>,
+    #[serde(default)]
+    pub source_hints: Vec<String>,
+    #[serde(default)]
+    pub freshness_required: bool,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default, JsonSchema)]
 pub struct UnderstandWorkContract {
     #[serde(default)]
@@ -1327,6 +1278,13 @@ pub struct SourceFileContext {
 pub struct ProposedCommand {
     pub program: String,
     pub args: Vec<String>,
+    /// Working directory relative to workspace root. None means workspace root.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cwd: Option<String>,
+    #[serde(default)]
+    pub expect_workspace_change: bool,
+    #[serde(default)]
+    pub expect_paths: Vec<String>,
 }
 
 /// A single file operation proposed by the LLM.
@@ -1449,6 +1407,10 @@ fn understand_system_prompt() -> &'static str {
     include_str!("../../../prompts/understand.system.txt")
 }
 
+fn knowledge_plan_system_prompt() -> &'static str {
+    include_str!("../../../prompts/knowledge-plan.system.txt")
+}
+
 fn clarify_user_prompt(artifact: &UnderstandingArtifact, agent_context: Option<&str>) -> String {
     let profile = &artifact.workspace_profile;
     let profile_str = format!(
@@ -1533,6 +1495,39 @@ fn understand_user_prompt(artifact: &UnderstandingArtifact, agent_context: Optio
         prompt.push_str(ctx);
     }
     prompt
+}
+
+fn knowledge_plan_user_prompt(artifact: &UnderstandingArtifact) -> String {
+    let profile = &artifact.workspace_profile;
+    include_str!("../../../prompts/knowledge-plan.user.txt")
+        .replace("{original_request}", &artifact.original_request)
+        .replace("{draft_interpreted_goal}", &artifact.interpreted_goal)
+        .replace(
+            "{workspace_profile}",
+            &format!(
+                "runtimes: {}; frameworks: {}; topology: {}; conflicts: {}",
+                if profile.runtimes.is_empty() {
+                    "unknown".into()
+                } else {
+                    profile.runtimes.join(", ")
+                },
+                if profile.frameworks.is_empty() {
+                    "none detected".into()
+                } else {
+                    profile.frameworks.join(", ")
+                },
+                profile.topology,
+                if profile.conflicts.is_empty() {
+                    "none".into()
+                } else {
+                    profile.conflicts.join(" | ")
+                }
+            ),
+        )
+        .replace(
+            "{observed_evidence}",
+            &serde_json::to_string(&artifact.evidence).unwrap_or_else(|_| "[]".into()),
+        )
 }
 
 // ── Evidence selection helpers ────────────────────────────────────────────────
@@ -1684,20 +1679,265 @@ fn strip_think_blocks(input: &str) -> &str {
     trimmed
 }
 
-fn action_schema_max_tokens(parameters: &serde_json::Value) -> u32 {
-    let tools = parameters
-        .get("properties")
-        .and_then(|properties| properties.get("tool"))
-        .and_then(|tool| tool.get("enum"))
-        .and_then(serde_json::Value::as_array);
-    let compact = tools.is_some_and(|tools| {
-        !tools.iter().any(|tool| {
-            tool.as_str()
-                .is_some_and(|name| matches!(name, "think" | "search_files"))
-        })
-    });
+fn strict_tool_schema(schema: &serde_json::Value) -> serde_json::Value {
+    let definitions = schema
+        .get("definitions")
+        .or_else(|| schema.get("$defs"))
+        .and_then(serde_json::Value::as_object);
+    normalize_tool_schema(schema, definitions)
+}
 
-    if compact { 512 } else { 2048 }
+fn openai_tool_definitions(tool: &ToolSpec) -> Vec<OaiToolDefinition> {
+    if tool.name == "agent_action" {
+        return agent_action_tool_definitions(tool);
+    }
+    vec![openai_tool_definition(
+        &tool.name,
+        &tool.description,
+        strict_tool_schema(&tool.parameters),
+    )]
+}
+
+fn openai_tool_definition(
+    name: &str,
+    description: &str,
+    parameters: serde_json::Value,
+) -> OaiToolDefinition {
+    OaiToolDefinition {
+        type_: "function".into(),
+        function: OaiToolFunction {
+            name: name.into(),
+            description: description.into(),
+            strict: true,
+            parameters,
+        },
+    }
+}
+
+fn agent_action_tool_definitions(tool: &ToolSpec) -> Vec<OaiToolDefinition> {
+    let names = tool
+        .parameters
+        .pointer("/properties/tool/enum")
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(serde_json::Value::as_str);
+
+    names
+        .filter_map(|name| agent_action_schema_for(name).map(|schema| (name, schema)))
+        .map(|(name, schema)| {
+            openai_tool_definition(name, &format!("Agent action: {name}."), schema)
+        })
+        .collect()
+}
+
+fn object_schema(required: &[&str], properties: serde_json::Value) -> serde_json::Value {
+    serde_json::json!({
+        "type": "object",
+        "additionalProperties": false,
+        "properties": properties,
+        "required": required,
+    })
+}
+
+fn agent_action_schema_for(name: &str) -> Option<serde_json::Value> {
+    Some(match name {
+        "read_file" => object_schema(
+            &["path"],
+            serde_json::json!({
+                "path": {"type": "string"}
+            }),
+        ),
+        "search_files" | "knowledge" => object_schema(
+            &["query"],
+            serde_json::json!({
+                "query": {"type": "string"}
+            }),
+        ),
+        "edit" => object_schema(
+            &["path", "start_line", "end_line", "content"],
+            serde_json::json!({
+                "path": {"type": "string"},
+                "start_line": {"type": "integer"},
+                "end_line": {"type": "integer"},
+                "content": {"type": "string"}
+            }),
+        ),
+        "command" => serde_json::json!({
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+                "command_line": {"type": "string"},
+                "cwd": {"type": "string"}
+            },
+            "required": ["command_line"]
+        }),
+        "ask_user" => object_schema(
+            &["question", "context"],
+            serde_json::json!({
+                "question": {"type": "string"},
+                "context": {"type": "string"}
+            }),
+        ),
+        "done" => object_schema(
+            &["description"],
+            serde_json::json!({
+                "description": {"type": "string"}
+            }),
+        ),
+        _ => return None,
+    })
+}
+
+fn agent_action_arguments(tool_name: &str, arguments_json: &str) -> InferResult<String> {
+    let mut arguments = match serde_json::from_str::<serde_json::Value>(arguments_json) {
+        Ok(serde_json::Value::Object(arguments)) => arguments,
+        Ok(_) => {
+            return Err(InferError::InvalidOutput {
+                retries: 0,
+                reason: format!("tool '{tool_name}' arguments must be a JSON object"),
+            });
+        }
+        Err(err) => return Err(InferError::Json(err)),
+    };
+    arguments.insert("tool".into(), serde_json::json!(tool_name));
+    serde_json::to_string(&serde_json::Value::Object(arguments)).map_err(InferError::Json)
+}
+
+fn chat_message(role: &str, content: &str) -> serde_json::Value {
+    serde_json::json!({"role": role, "content": content})
+}
+
+fn native_chat_messages(messages: &[ChatMessage], tool: &ToolSpec) -> Vec<serde_json::Value> {
+    if tool.name != "agent_action" {
+        return messages
+            .iter()
+            .map(|message| chat_message(&message.role, &message.content))
+            .collect();
+    }
+
+    let mut out = Vec::new();
+    let mut index = 0usize;
+    while index < messages.len() {
+        let message = &messages[index];
+        if message.role == "assistant"
+            && let Some((name, arguments)) = assistant_action_tool_call(&message.content)
+        {
+            let id = format!("call_history_{index}");
+            out.push(serde_json::json!({
+                "role": "assistant",
+                "content": null,
+                "tool_calls": [{
+                    "id": id,
+                    "type": "function",
+                    "function": {
+                        "name": name,
+                        "arguments": arguments.to_string()
+                    }
+                }]
+            }));
+            if let Some(result) = messages.get(index + 1).filter(|next| next.role == "user") {
+                out.push(serde_json::json!({
+                    "role": "tool",
+                    "tool_call_id": id,
+                    "name": name,
+                    "content": result.content
+                }));
+                index += 2;
+                continue;
+            }
+            index += 1;
+            continue;
+        }
+        out.push(chat_message(&message.role, &message.content));
+        index += 1;
+    }
+    out
+}
+
+fn assistant_action_tool_call(content: &str) -> Option<(String, serde_json::Value)> {
+    let mut action =
+        serde_json::from_str::<serde_json::Map<String, serde_json::Value>>(content).ok()?;
+    let name = action.remove("tool")?.as_str()?.to_string();
+    agent_action_schema_for(&name)?;
+    Some((name, serde_json::Value::Object(action)))
+}
+
+fn normalize_tool_schema(
+    schema: &serde_json::Value,
+    definitions: Option<&serde_json::Map<String, serde_json::Value>>,
+) -> serde_json::Value {
+    if let Some(reference) = schema.get("$ref").and_then(serde_json::Value::as_str)
+        && let Some(name) = reference
+            .strip_prefix("#/definitions/")
+            .or_else(|| reference.strip_prefix("#/$defs/"))
+        && let Some(target) = definitions.and_then(|defs| defs.get(name))
+    {
+        return normalize_tool_schema(target, definitions);
+    }
+
+    match schema {
+        serde_json::Value::Object(object) => {
+            let mut out = serde_json::Map::new();
+            for (key, value) in object {
+                if matches!(
+                    key.as_str(),
+                    "$schema" | "$defs" | "definitions" | "default" | "title" | "$ref"
+                ) {
+                    continue;
+                }
+                let normalized = match key.as_str() {
+                    "properties" => serde_json::Value::Object(
+                        value
+                            .as_object()
+                            .map(|properties| {
+                                properties
+                                    .iter()
+                                    .map(|(name, property)| {
+                                        (name.clone(), normalize_tool_schema(property, definitions))
+                                    })
+                                    .collect::<serde_json::Map<_, _>>()
+                            })
+                            .unwrap_or_default(),
+                    ),
+                    "items" => normalize_tool_schema(value, definitions),
+                    "anyOf" | "oneOf" | "allOf" => serde_json::Value::Array(
+                        value
+                            .as_array()
+                            .map(|items| {
+                                items
+                                    .iter()
+                                    .map(|item| normalize_tool_schema(item, definitions))
+                                    .collect()
+                            })
+                            .unwrap_or_default(),
+                    ),
+                    _ => value.clone(),
+                };
+                out.insert(key.clone(), normalized);
+            }
+
+            if out.get("type").and_then(serde_json::Value::as_str) == Some("object") {
+                out.entry("additionalProperties")
+                    .or_insert_with(|| serde_json::json!(false));
+                if let Some(properties) =
+                    out.get("properties").and_then(serde_json::Value::as_object)
+                {
+                    let mut required = properties.keys().cloned().collect::<Vec<_>>();
+                    required.sort();
+                    out.insert("required".into(), serde_json::json!(required));
+                }
+            }
+            serde_json::Value::Object(out)
+        }
+        serde_json::Value::Array(items) => serde_json::Value::Array(
+            items
+                .iter()
+                .map(|item| normalize_tool_schema(item, definitions))
+                .collect(),
+        ),
+        _ => schema.clone(),
+    }
 }
 
 // ── Internal HTTP types: OpenAI-compat ───────────────────────────────────────
@@ -1705,7 +1945,7 @@ fn action_schema_max_tokens(parameters: &serde_json::Value) -> u32 {
 #[derive(Debug, Serialize)]
 struct ChatCompletionRequest {
     model: String,
-    messages: Vec<ChatMessage>,
+    messages: Vec<serde_json::Value>,
     temperature: Option<f32>,
     /// Generous cap so thinking-model reasoning tokens don't exhaust the budget
     /// before the model can emit the actual structured output.
@@ -1768,6 +2008,7 @@ struct OaiToolDefinition {
 struct OaiToolFunction {
     name: String,
     description: String,
+    strict: bool,
     parameters: serde_json::Value,
 }
 
@@ -1793,6 +2034,8 @@ struct ChatChoice {
 #[derive(Debug, Deserialize)]
 struct AssistantMessage {
     content: Option<String>,
+    #[serde(default)]
+    reasoning_content: Option<String>,
     /// Present in tool-calling mode (non-grammar models). Grammar/JsonSchema
     /// models put the tool-call JSON in `content` instead.
     #[serde(default)]
@@ -1808,6 +2051,56 @@ struct RespToolCall {
 struct RespFunction {
     name: String,
     arguments: String,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct NormalizedAssistantOutput {
+    text: Option<String>,
+    thinking: Option<String>,
+    tool_call: Option<NormalizedToolCall>,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct NormalizedToolCall {
+    name: String,
+    arguments_json: String,
+}
+
+fn normalize_chat_completion_message(
+    message: Option<AssistantMessage>,
+    tool_name: &str,
+    tool_choice_mode: ToolChoiceMode,
+) -> InferResult<NormalizedAssistantOutput> {
+    let message = message.ok_or(InferError::EmptyResponse)?;
+    let thinking = message
+        .reasoning_content
+        .map(|content| content.trim().to_string())
+        .filter(|s| !s.is_empty());
+    if let Some(tc) = message.tool_calls.as_ref().and_then(|calls| calls.first()) {
+        return Ok(NormalizedAssistantOutput {
+            text: message
+                .content
+                .map(|content| content.trim().to_string())
+                .filter(|s| !s.is_empty()),
+            thinking,
+            tool_call: Some(NormalizedToolCall {
+                name: tc.function.name.clone(),
+                arguments_json: tc.function.arguments.clone(),
+            }),
+        });
+    }
+
+    let _ = (tool_name, tool_choice_mode);
+    let text = message
+        .content
+        .map(|content| content.trim().to_string())
+        .filter(|s| !s.is_empty());
+
+    Ok(NormalizedAssistantOutput {
+        text,
+        thinking,
+        tool_call: None,
+    })
 }
 
 // ── Internal HTTP types: Ollama ───────────────────────────────────────────────
@@ -1892,8 +2185,9 @@ mod tests {
     use time::macros::datetime;
 
     use super::{
-        ClarifyNode, OpenAiCompatProvider, ProviderCapabilities, ToolCall, ToolChoiceMode,
-        ToolProvider, ToolSpec, UnderstandNode, extract_json_object,
+        AssistantMessage, ClarifyNode, OpenAiCompatProvider, OpenAiTransport, ProviderCapabilities,
+        RespFunction, RespToolCall, ToolCall, ToolChoiceMode, ToolProvider, ToolSpec,
+        UnderstandNode, extract_json_object, normalize_chat_completion_message,
     };
 
     struct StubProvider;
@@ -2010,7 +2304,7 @@ mod tests {
             evidence: vec![EvidenceRef {
                 kind: EvidenceKind::Other,
                 locator: "workspace-profile".into(),
-                summary: "package manager appears to be npm; root manifests: package.json".into(),
+                summary: "workspace profile evidence is available".into(),
             }],
             candidate_files: vec![],
             package_facts: vec![],
@@ -2031,7 +2325,7 @@ mod tests {
 
         assert!(prompt.contains("observed_evidence"));
         assert!(prompt.contains("workspace-profile"));
-        assert!(prompt.contains("package manager appears to be npm"));
+        assert!(prompt.contains("workspace profile evidence is available"));
     }
 
     #[test]
@@ -2191,6 +2485,30 @@ mod tests {
         serde_json::to_value(request).unwrap()
     }
 
+    fn request_agent_action_json() -> serde_json::Value {
+        let provider = OpenAiCompatProvider::new("http://localhost:8080", "test-model")
+            .with_capabilities(ProviderCapabilities {
+                tool_choice_mode: ToolChoiceMode::RequiredString,
+                max_tokens: 32768,
+                ..Default::default()
+            });
+        let request = provider.request_for(
+            "system",
+            "user",
+            &ToolSpec {
+                name: "agent_action".into(),
+                description: "structured output".into(),
+                parameters: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "tool": {"type": "string", "enum": ["read_file", "edit", "command", "done"]}
+                    }
+                }),
+            },
+        );
+        serde_json::to_value(request).unwrap()
+    }
+
     #[test]
     fn llama_cpp_tool_choice_is_a_required_string() {
         assert_eq!(
@@ -2203,56 +2521,160 @@ mod tests {
     fn named_object_tool_choice_targets_the_declared_tool() {
         assert_eq!(
             request_json(ToolChoiceMode::NamedObject)["tool_choice"],
-            serde_json::json!({
-                "type": "function",
-                "function": {"name": "output"}
-            })
+            serde_json::json!("required")
         );
     }
 
     #[test]
-    fn omitted_tool_choice_is_not_serialized() {
+    fn tool_choice_mode_does_not_change_single_request_path() {
+        assert_eq!(
+            request_json(ToolChoiceMode::Omit)["tool_choice"],
+            serde_json::json!("required")
+        );
+        assert_eq!(
+            request_json(ToolChoiceMode::JsonSchema)["tool_choice"],
+            serde_json::json!("required")
+        );
+    }
+
+    #[test]
+    fn request_uses_strict_function_tools_not_response_format() {
+        let req = request_json(ToolChoiceMode::JsonSchema);
+        assert!(req.get("response_format").is_none());
+        assert_eq!(req["tools"][0]["type"], "function");
+        assert_eq!(req["tools"][0]["function"]["name"], "output");
+        assert_eq!(req["tools"][0]["function"]["strict"], true);
+        assert_eq!(
+            req["tools"][0]["function"]["parameters"]["additionalProperties"],
+            false
+        );
+    }
+
+    #[test]
+    fn agent_action_expands_to_separate_function_tools() {
+        let req = request_agent_action_json();
+        let tools = req["tools"].as_array().unwrap();
+        let names = tools
+            .iter()
+            .map(|tool| tool["function"]["name"].as_str().unwrap())
+            .collect::<Vec<_>>();
+
+        assert_eq!(names, vec!["read_file", "edit", "command", "done"]);
+        assert_eq!(
+            tools[1]["function"]["parameters"]["required"],
+            serde_json::json!(["path", "start_line", "end_line", "content"])
+        );
+        assert_eq!(
+            tools[3]["function"]["parameters"]["required"],
+            serde_json::json!(["description"])
+        );
+    }
+
+    #[test]
+    fn agent_action_arguments_wrap_selected_function_name() {
+        let wrapped = super::agent_action_arguments("done", "{\"description\":\"ok\"}").unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&wrapped).unwrap();
+
+        assert_eq!(parsed["tool"], "done");
+        assert_eq!(parsed["description"], "ok");
+    }
+
+    #[test]
+    fn agent_action_history_uses_native_tool_messages() {
+        let messages = vec![
+            super::ChatMessage {
+                role: "system".into(),
+                content: "system".into(),
+            },
+            super::ChatMessage {
+                role: "user".into(),
+                content: "task".into(),
+            },
+            super::ChatMessage {
+                role: "assistant".into(),
+                content: r#"{"tool":"read_file","path":"src/lib.rs"}"#.into(),
+            },
+            super::ChatMessage {
+                role: "user".into(),
+                content: "loaded file".into(),
+            },
+        ];
+        let tool = ToolSpec {
+            name: "agent_action".into(),
+            description: "structured output".into(),
+            parameters: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "tool": {"type": "string", "enum": ["read_file"]}
+                }
+            }),
+        };
+
+        let native = super::native_chat_messages(&messages, &tool);
+
+        assert_eq!(native[2]["role"], "assistant");
+        assert_eq!(native[2]["content"], serde_json::Value::Null);
+        assert_eq!(native[2]["tool_calls"][0]["function"]["name"], "read_file");
+        assert_eq!(native[3]["role"], "tool");
+        assert_eq!(native[3]["name"], "read_file");
+        assert_eq!(native[3]["tool_call_id"], native[2]["tool_calls"][0]["id"]);
+    }
+
+    #[test]
+    fn json_schema_request_uses_provider_max_tokens() {
+        let req = request_json(ToolChoiceMode::JsonSchema);
+        assert_eq!(req["max_tokens"], 32768);
+    }
+
+    #[test]
+    fn tool_schema_is_flat_strict_and_openai_compatible() {
+        let schema = serde_json::json!({
+            "$schema": "http://json-schema.org/draft-07/schema#",
+            "definitions": {
+                "Request": {
+                    "type": "object",
+                    "properties": {
+                        "summary": {"type": "string"},
+                        "freshness_required": {"type": "boolean", "default": false}
+                    },
+                    "required": ["summary"]
+                }
+            },
+            "type": "object",
+            "title": "KnowledgePlanOutput",
+            "properties": {
+                "should_research": {"type": "boolean"},
+                "rationale": {"type": "string", "default": ""},
+                "requests": {
+                    "type": "array",
+                    "items": {"$ref": "#/definitions/Request"}
+                }
+            },
+            "required": ["should_research"]
+        });
+
+        let normalized = super::strict_tool_schema(&schema);
+
+        assert!(normalized.get("$schema").is_none());
+        assert!(normalized.get("definitions").is_none());
+        assert_eq!(normalized["additionalProperties"], false);
+        assert_eq!(
+            normalized["required"],
+            serde_json::json!(["rationale", "requests", "should_research"])
+        );
+        assert_eq!(
+            normalized["properties"]["requests"]["items"]["additionalProperties"],
+            false
+        );
+        assert_eq!(
+            normalized["properties"]["requests"]["items"]["required"],
+            serde_json::json!(["freshness_required", "summary"])
+        );
         assert!(
-            request_json(ToolChoiceMode::Omit)
-                .get("tool_choice")
+            normalized["properties"]["rationale"]
+                .get("default")
                 .is_none()
         );
-    }
-
-    #[test]
-    fn json_schema_mode_uses_response_format_not_tools() {
-        let req = request_json(ToolChoiceMode::JsonSchema);
-        // No tool_choice and no tools array.
-        assert!(req.get("tool_choice").is_none());
-        assert!(
-            req["tools"]
-                .as_array()
-                .map(|a| a.is_empty())
-                .unwrap_or(true)
-        );
-        // response_format carries the schema.
-        assert_eq!(req["response_format"]["type"], "json_schema");
-        assert_eq!(req["response_format"]["json_schema"]["name"], "output");
-        assert!(req["response_format"]["json_schema"]["schema"].is_object());
-    }
-
-    #[test]
-    fn compact_action_schema_uses_smaller_token_budget() {
-        let compact = serde_json::json!({
-            "type": "object",
-            "properties": {
-                "tool": {"type": "string", "enum": ["replace_lines", "read_file", "command", "done"]}
-            }
-        });
-        let exploratory = serde_json::json!({
-            "type": "object",
-            "properties": {
-                "tool": {"type": "string", "enum": ["think", "read_file", "search_files", "command", "done"]}
-            }
-        });
-
-        assert_eq!(super::action_schema_max_tokens(&compact), 512);
-        assert_eq!(super::action_schema_max_tokens(&exploratory), 2048);
     }
 
     #[test]
@@ -2265,5 +2687,61 @@ mod tests {
     fn extract_json_strips_plain_fence() {
         let fenced = "```\n{\"a\":1}\n```";
         assert_eq!(super::extract_json_object(fenced), "{\"a\":1}");
+    }
+
+    #[test]
+    fn normalize_chat_completion_prefers_tool_calls_when_present() {
+        let normalized = normalize_chat_completion_message(
+            Some(AssistantMessage {
+                content: Some("ignored".into()),
+                reasoning_content: Some("thoughts".into()),
+                tool_calls: Some(vec![RespToolCall {
+                    function: RespFunction {
+                        name: "output".into(),
+                        arguments: "{\"ok\":true}".into(),
+                    },
+                }]),
+            }),
+            "output",
+            ToolChoiceMode::RequiredString,
+        )
+        .unwrap();
+
+        assert_eq!(normalized.thinking.as_deref(), Some("thoughts"));
+        assert_eq!(
+            normalized.tool_call.unwrap().arguments_json,
+            "{\"ok\":true}"
+        );
+    }
+
+    #[test]
+    fn normalize_chat_completion_requires_real_tool_call() {
+        let normalized = normalize_chat_completion_message(
+            Some(AssistantMessage {
+                content: Some("<think>hidden</think>{\"ok\":true}".into()),
+                reasoning_content: None,
+                tool_calls: None,
+            }),
+            "output",
+            ToolChoiceMode::JsonSchema,
+        )
+        .unwrap();
+
+        assert!(normalized.tool_call.is_none());
+    }
+
+    #[test]
+    fn ollama_detect_uses_chat_completion_tools() {
+        let caps = super::ProviderCapabilities::detect("mistral", "http://127.0.0.1:11434/v1");
+        assert_eq!(caps.preferred_transport, OpenAiTransport::ChatCompletions);
+        assert_eq!(caps.tool_choice_mode, ToolChoiceMode::RequiredString);
+    }
+
+    #[test]
+    fn thinking_model_detect_uses_tool_calling_when_supported() {
+        let caps =
+            super::ProviderCapabilities::detect("google/gemma3-9b-it", "http://127.0.0.1:8080/v1");
+        assert_eq!(caps.tool_choice_mode, ToolChoiceMode::RequiredString);
+        assert_eq!(caps.preferred_transport, OpenAiTransport::ChatCompletions);
     }
 }
