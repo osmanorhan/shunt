@@ -64,6 +64,88 @@ impl CapabilityTask {
     }
 }
 
+// ── Reasoning-task grading helpers ──────────────────────────────────────────────
+
+fn refund_policy_ok(c: &str) -> bool {
+    let has_half = c.contains("0.5") || c.contains("/ 2") || c.contains("/2");
+    let has_14 = c.contains("14");
+    let has_7 = c.contains('7');
+    let has_24 = c.contains("24");
+    if !(has_half && has_14 && has_7 && has_24) {
+        return false;
+    }
+    // The 24h grace period must be scoped inside the under-7-days branch, not applied
+    // globally. In a natural top-to-bottom if/else-if chain that means its "24" token
+    // appears after both the 14-day and 7-day threshold checks in source order —
+    // a model that hoists the grace check first/globally fails this ordering.
+    let (Some(pos_14), Some(pos_7), Some(pos_24)) = (c.find("14"), c.find('7'), c.find("24"))
+    else {
+        return false;
+    };
+    pos_24 > pos_14 && pos_24 > pos_7
+}
+
+fn extract_quoted(c: &str, key: &str) -> Option<String> {
+    let idx = c.find(key)?;
+    let rest = &c[idx + key.len()..];
+    let bytes = rest.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() && (bytes[i] as char).is_whitespace() {
+        i += 1;
+    }
+    let quote = *bytes.get(i)?;
+    if quote != b'\'' && quote != b'"' {
+        return None;
+    }
+    let after = &rest[i + 1..];
+    let end = after.find(quote as char)?;
+    Some(after[..end].to_string())
+}
+
+fn oncall_schedule_ok(c: &str) -> bool {
+    let names = ["alice", "bob", "carol", "dave"];
+    let days = ["mon", "tue", "wed", "thu", "fri", "sat", "sun"];
+    let mut assigned = Vec::with_capacity(7);
+    for day in days {
+        match extract_quoted(c, &format!("{day}:")) {
+            Some(name) if names.contains(&name.as_str()) => assigned.push(name),
+            _ => return false,
+        }
+    }
+    let (mon, thu, fri, sat, sun) = (
+        &assigned[0],
+        &assigned[3],
+        &assigned[4],
+        &assigned[5],
+        &assigned[6],
+    );
+    if mon == "alice" || thu == "dave" {
+        return false;
+    }
+    if assigned[0..5].windows(2).any(|w| w[0] == w[1]) {
+        return false;
+    }
+    if fri == sat || sat != sun {
+        return false;
+    }
+    if names
+        .iter()
+        .any(|n| assigned.iter().filter(|a| a.as_str() == *n).count() > 2)
+    {
+        return false;
+    }
+    names.iter().all(|n| assigned.iter().any(|a| a == n))
+}
+
+fn meeting_conflict_ok(c: &str) -> bool {
+    let no_touch_as_conflict = !c.contains("<=");
+    let checks_both_directions = c.contains("a.start")
+        && c.contains("b.end")
+        && c.contains("b.start")
+        && c.contains("a.end");
+    no_touch_as_conflict && checks_both_directions
+}
+
 // ── Suite ─────────────────────────────────────────────────────────────────────
 
 pub fn suite() -> Vec<CapabilityTask> {
@@ -1733,6 +1815,384 @@ pub fn suite() -> Vec<CapabilityTask> {
                     && c.contains("pricing")
                     && c.contains("shipping")
             })],
+        },
+        // ── Distraction / precision / instruction-following tasks ──────────────
+        CapabilityTask {
+            name: "needle_in_haystack_db_typo",
+            difficulty: Difficulty::Hard,
+            request: "The app fails to connect to the database in production but works fine \
+                      locally. Find and fix the bug.",
+            files: &[
+                (
+                    "src/config/env.ts",
+                    "export const env = {\n  \
+                     databaseUrl: process.env.DATABSE_URL ?? '',\n  \
+                     redisUrl: process.env.REDIS_URL ?? '',\n  \
+                     port: Number(process.env.PORT ?? 3000),\n};\n",
+                ),
+                (
+                    "src/db.ts",
+                    "import { env } from './config/env';\n\n\
+                     export const db = {\n  \
+                     connect: async () => ({ url: env.databaseUrl }),\n};\n",
+                ),
+                (
+                    "src/users/repository.ts",
+                    "export const users = {\n  \
+                     findById: async (_id: string) => null as any,\n};\n",
+                ),
+                (
+                    "src/orders/repository.ts",
+                    "export const orders = {\n  \
+                     findById: async (_id: string) => null as any,\n};\n",
+                ),
+                (
+                    "src/products/repository.ts",
+                    "export const products = {\n  \
+                     findById: async (_id: string) => null as any,\n};\n",
+                ),
+                (
+                    "src/cache/memory.ts",
+                    "const store = new Map<string, unknown>();\n\n\
+                     export const cache = {\n  \
+                     get: (key: string) => store.get(key),\n  \
+                     set: (key: string, value: unknown) => store.set(key, value),\n};\n",
+                ),
+                (
+                    "src/logger.ts",
+                    "export const logger = {\n  \
+                     info: (msg: string) => console.log(msg),\n  \
+                     error: (msg: string) => console.error(msg),\n};\n",
+                ),
+                (
+                    "src/mailer.ts",
+                    "export const mailer = {\n  \
+                     send: async (_to: string, _subject: string) => ({ ok: true }),\n};\n",
+                ),
+                (
+                    "src/metrics.ts",
+                    "export const metrics = {\n  \
+                     increment: (_name: string) => {},\n};\n",
+                ),
+                (
+                    "src/routes/health.ts",
+                    "import { Router } from 'express';\n\n\
+                     const router = Router();\n\
+                     router.get('/health', (_req, res) => res.json({ ok: true }));\n\n\
+                     export default router;\n",
+                ),
+                (
+                    "src/middleware/auth.ts",
+                    "import { Request, Response, NextFunction } from 'express';\n\n\
+                     export function requireAuth(req: Request, res: Response, next: NextFunction): void {\n  \
+                     next();\n}\n",
+                ),
+                (
+                    "src/session.ts",
+                    "export const session = {\n  \
+                     store: new Map<string, unknown>(),\n};\n",
+                ),
+            ],
+            checks: &[("src/config/env.ts", |c| {
+                c.contains("DATABASE_URL") && !c.contains("DATABSE_URL")
+            })],
+        },
+        CapabilityTask {
+            name: "multi_site_rename_no_miss",
+            difficulty: Difficulty::Hard,
+            request: "Rename getActiveSubscription to getCurrentSubscription everywhere — the \
+                      current name is misleading since it also returns subscriptions that are \
+                      pending cancellation. Update every reference: the service, both route \
+                      handlers, the renewal job, and the test file.",
+            files: &[
+                (
+                    "src/subscriptions/service.ts",
+                    "import { db } from '../db';\n\n\
+                     export async function getActiveSubscription(userId: string) {\n  \
+                     return db.subscriptions.findFirst({ where: { userId } });\n}\n",
+                ),
+                (
+                    "src/routes/billing.ts",
+                    "import { Router } from 'express';\n\
+                     import { getActiveSubscription } from '../subscriptions/service';\n\n\
+                     const router = Router();\n\n\
+                     router.get('/billing', async (req, res, next) => {\n  \
+                     try {\n    \
+                     const sub = await getActiveSubscription(req.query.userId as string);\n    \
+                     res.json(sub);\n  \
+                     } catch (err) { next(err); }\n});\n\n\
+                     export default router;\n",
+                ),
+                (
+                    "src/routes/account.ts",
+                    "import { Router } from 'express';\n\
+                     import { getActiveSubscription } from '../subscriptions/service';\n\n\
+                     const router = Router();\n\n\
+                     router.get('/account', async (req, res, next) => {\n  \
+                     try {\n    \
+                     const sub = await getActiveSubscription(req.query.userId as string);\n    \
+                     res.json({ plan: sub?.plan });\n  \
+                     } catch (err) { next(err); }\n});\n\n\
+                     export default router;\n",
+                ),
+                (
+                    "src/jobs/renewal.ts",
+                    "import { getActiveSubscription } from '../subscriptions/service';\n\n\
+                     export async function runRenewalJob(userId: string): Promise<void> {\n  \
+                     const sub = await getActiveSubscription(userId);\n  \
+                     if (sub) console.log(`renewing ${sub.id}`);\n}\n",
+                ),
+                (
+                    "src/subscriptions/service.test.ts",
+                    "import { getActiveSubscription } from './service';\n\n\
+                     describe('getActiveSubscription', () => {\n  \
+                     it('returns the subscription for a user', async () => {\n    \
+                     const sub = await getActiveSubscription('u1');\n    \
+                     expect(sub).toBeDefined();\n  });\n});\n",
+                ),
+                (
+                    "src/db.ts",
+                    "export const db = {\n  \
+                     subscriptions: { findFirst: async (_q: any) => ({ id: 's1', plan: 'pro' } as any) },\n};\n",
+                ),
+            ],
+            checks: &[
+                ("src/subscriptions/service.ts", |c| {
+                    c.contains("getCurrentSubscription") && !c.contains("getActiveSubscription")
+                }),
+                ("src/routes/billing.ts", |c| {
+                    c.contains("getCurrentSubscription") && !c.contains("getActiveSubscription")
+                }),
+                ("src/routes/account.ts", |c| {
+                    c.contains("getCurrentSubscription") && !c.contains("getActiveSubscription")
+                }),
+                ("src/jobs/renewal.ts", |c| {
+                    c.contains("getCurrentSubscription") && !c.contains("getActiveSubscription")
+                }),
+                ("src/subscriptions/service.test.ts", |c| {
+                    c.contains("getCurrentSubscription") && !c.contains("getActiveSubscription")
+                }),
+            ],
+        },
+        CapabilityTask {
+            name: "near_duplicate_function_trap",
+            difficulty: Difficulty::Hard,
+            request: "sendInvoiceEmail silently drops invoices when the mail provider returns a \
+                      5xx. Add up to 3 retries with a 500ms delay between attempts, only in \
+                      sendInvoiceEmail. Do not change sendInvoiceReminderEmail — it has different \
+                      delivery requirements and is out of scope for this fix.",
+            files: &[
+                (
+                    "src/billing/invoices.ts",
+                    "import { mailer } from '../mailer';\n\n\
+                     export interface Invoice { email: string; id: string; }\n\n\
+                     export async function sendInvoiceEmail(invoice: Invoice): Promise<void> {\n  \
+                     const res = await mailer.send(invoice.email, 'invoice', invoice);\n  \
+                     if (!res.ok) throw new Error('failed to send invoice email');\n}\n\n\
+                     export async function sendInvoiceReminderEmail(invoice: Invoice): Promise<void> {\n  \
+                     const res = await mailer.send(invoice.email, 'invoice-reminder', invoice);\n  \
+                     if (!res.ok) throw new Error('failed to send reminder email');\n}\n",
+                ),
+                (
+                    "src/mailer.ts",
+                    "export const mailer = {\n  \
+                     send: async (_to: string, _template: string, _data: unknown) => ({ ok: true }),\n};\n",
+                ),
+            ],
+            checks: &[("src/billing/invoices.ts", |c| {
+                let reminder_untouched = c.contains(
+                    "sendInvoiceReminderEmail(invoice: Invoice): Promise<void> {\n  \
+                     const res = await mailer.send(invoice.email, 'invoice-reminder', invoice);\n  \
+                     if (!res.ok) throw new Error('failed to send reminder email');\n}",
+                );
+                let has_retry =
+                    (c.contains("attempt") || c.contains("retries") || c.contains("for (let"))
+                        && c.contains("500")
+                        && c.contains("sendInvoiceEmail");
+                reminder_untouched && has_retry
+            })],
+        },
+        CapabilityTask {
+            name: "stale_comment_misleads",
+            difficulty: Difficulty::Medium,
+            request: "The /admin dashboard is accessible to regular users. isAdmin in \
+                      src/auth/roles.ts is returning the wrong result — fix it so only users \
+                      with the 'admin' role pass.",
+            files: &[(
+                "src/auth/roles.ts",
+                "// Returns true only when the user has the 'admin' role.\n\
+                 export function isAdmin(role: string): boolean {\n  \
+                 return role !== 'admin';\n}\n",
+            )],
+            checks: &[("src/auth/roles.ts", |c| {
+                c.contains("role === 'admin'") && !c.contains("role !== 'admin'")
+            })],
+        },
+        CapabilityTask {
+            name: "conflicting_priority_constraint",
+            difficulty: Difficulty::Hard,
+            request: "Add input validation to POST /comments in src/routes/comments.ts: the \
+                      body must include a non-empty string `text` and a string `postId`. \
+                      Return 422 with an error message on invalid input. Important: do NOT add \
+                      any new npm dependencies — we're in a dependency freeze this sprint, so \
+                      implement the validation with plain TypeScript, not a schema library.",
+            files: &[
+                (
+                    "src/routes/comments.ts",
+                    "import { Router } from 'express';\n\
+                     import { db } from '../db';\n\n\
+                     const router = Router();\n\n\
+                     router.post('/comments', async (req, res, next) => {\n  \
+                     try {\n    \
+                     const { text, postId } = req.body;\n    \
+                     const comment = await db.comments.create({ data: { text, postId } });\n    \
+                     res.status(201).json(comment);\n  \
+                     } catch (err) { next(err); }\n});\n\n\
+                     export default router;\n",
+                ),
+                (
+                    "src/db.ts",
+                    "export const db = {\n  \
+                     comments: { create: async (_q: any) => ({ id: '1' }) },\n};\n",
+                ),
+                (
+                    "package.json",
+                    "{\n  \"name\": \"mini-service\",\n  \"version\": \"1.0.0\",\n  \
+                     \"dependencies\": {\n    \"express\": \"^4.19.0\"\n  }\n}\n",
+                ),
+            ],
+            checks: &[("src/routes/comments.ts", |c| {
+                let no_new_deps = !c.contains("from 'zod'")
+                    && !c.contains("from \"zod\"")
+                    && !c.contains("from 'joi'")
+                    && !c.contains("from 'yup'")
+                    && !c.contains("from '@hapi");
+                let validates = c.contains("typeof")
+                    && c.contains("text")
+                    && c.contains("postId")
+                    && c.contains("422");
+                no_new_deps && validates
+            })],
+        },
+        CapabilityTask {
+            name: "no_op_already_pooled_connections",
+            difficulty: Difficulty::Hard,
+            request: "Under load, the orders service exhausts database connections because it \
+                      appears to open a new connection per request. Find and fix the \
+                      connection-exhaustion bug in src/orders/repository.ts.",
+            files: &[
+                (
+                    "src/db/pool.ts",
+                    "const pool = { acquire: () => ({ query: async (_sql: string) => [] as any[] }) };\n\n\
+                     export function getConnection() {\n  \
+                     return pool.acquire();\n}\n",
+                ),
+                (
+                    "src/orders/repository.ts",
+                    "import { getConnection } from '../db/pool';\n\n\
+                     export async function findOrder(id: string) {\n  \
+                     const conn = getConnection();\n  \
+                     return conn.query(`SELECT * FROM orders WHERE id = '${id}'`);\n}\n\n\
+                     export async function listOrders() {\n  \
+                     const conn = getConnection();\n  \
+                     return conn.query('SELECT * FROM orders');\n}\n",
+                ),
+            ],
+            checks: &[("src/orders/repository.ts", |c| {
+                // Good model recognises the pool is already shared and leaves connection
+                // handling untouched. Bad model "fixes" the working code by creating a
+                // fresh connection/pool per call.
+                c.contains("getConnection()")
+                    && !c.contains("createConnection(")
+                    && !c.contains("new Pool(")
+                    && !c.contains("new Connection(")
+            })],
+        },
+        // ── Reasoning tasks: niche, uncontaminated by common OSS patterns ──────
+        CapabilityTask {
+            name: "tiered_refund_grace_exception",
+            difficulty: Difficulty::Hard,
+            request: "Implement calculateRefund in src/billing/refunds.ts per our new \
+                      cancellation policy: if cancelling more than 14 days before the event, \
+                      refund 100% of ticketPrice. If cancelling 7 to 14 days before the event, \
+                      refund 50%. If cancelling fewer than 7 days before the event, refund 0% — \
+                      unless the ticket was purchased less than 24 hours ago (a grace period \
+                      for accidental purchases), in which case refund 100% instead.",
+            files: &[(
+                "src/billing/refunds.ts",
+                "export function calculateRefund(\n  \
+                 daysUntilEvent: number,\n  \
+                 hoursSincePurchase: number,\n  \
+                 ticketPrice: number,\n): number {\n  \
+                 return ticketPrice;\n}\n",
+            )],
+            checks: &[("src/billing/refunds.ts", refund_policy_ok)],
+        },
+        CapabilityTask {
+            name: "hotel_stay_length_bug",
+            difficulty: Difficulty::Hard,
+            request: "Some customers' final bills don't match nightlyRate times the number of \
+                      nights they stayed. Investigate nightsStayed in src/billing/nights.ts and \
+                      fix the bug.",
+            files: &[(
+                "src/billing/nights.ts",
+                "export function nightsStayed(checkIn: string, checkOut: string): number {\n  \
+                 const inDate = new Date(checkIn);\n  \
+                 const outDate = new Date(checkOut);\n  \
+                 const msPerNight = 24 * 60 * 60 * 1000;\n  \
+                 return Math.round((outDate.getTime() - inDate.getTime()) / msPerNight) + 1;\n}\n",
+            )],
+            checks: &[("src/billing/nights.ts", |c| {
+                c.contains("outDate.getTime() - inDate.getTime()")
+                    && (c.contains("Math.round(") || c.contains("Math.floor("))
+                    && !c.contains(") + 1")
+                    && !c.contains(")+1")
+            })],
+        },
+        CapabilityTask {
+            name: "oncall_schedule_puzzle",
+            difficulty: Difficulty::Hard,
+            request: "Fill in the on-call `schedule` object in src/scheduling/oncall.ts (mon \
+                      through sun) so every constraint holds: alice is never on-call on \
+                      Monday; dave is never on-call on Thursday; the same engineer is never \
+                      on-call on two consecutive weekdays (Monday through Friday); Friday and \
+                      Saturday must be covered by two different engineers; Saturday and Sunday \
+                      must be covered by the SAME engineer, since the weekend is one \
+                      continuous on-call shift; no engineer covers more than 2 days total \
+                      across the week; and all four engineers (alice, bob, carol, dave) must \
+                      be on-call at least once. Keep the `schedule` object literal structure \
+                      exactly as-is (the same seven keys, one engineer per day) — just change \
+                      the assigned values.",
+            files: &[(
+                "src/scheduling/oncall.ts",
+                "export type Engineer = 'alice' | 'bob' | 'carol' | 'dave';\n\
+                 export type Day = 'mon' | 'tue' | 'wed' | 'thu' | 'fri' | 'sat' | 'sun';\n\n\
+                 export const schedule: Record<Day, Engineer> = {\n  \
+                 mon: 'alice',\n  \
+                 tue: 'alice',\n  \
+                 wed: 'alice',\n  \
+                 thu: 'alice',\n  \
+                 fri: 'alice',\n  \
+                 sat: 'alice',\n  \
+                 sun: 'alice',\n};\n",
+            )],
+            checks: &[("src/scheduling/oncall.ts", oncall_schedule_ok)],
+        },
+        CapabilityTask {
+            name: "back_to_back_meeting_overlap",
+            difficulty: Difficulty::Hard,
+            request: "hasConflict in src/scheduling/conflicts.ts is flagging back-to-back \
+                      meetings as conflicts — a meeting that ends at 2:00pm and another that \
+                      starts at 2:00pm are being reported as a conflict, blocking legitimate \
+                      bookings. Meetings that genuinely overlap, even by a single minute, must \
+                      still be flagged. Fix hasConflict.",
+            files: &[(
+                "src/scheduling/conflicts.ts",
+                "export interface Meeting {\n  start: number;\n  end: number;\n}\n\n\
+                 export function hasConflict(a: Meeting, b: Meeting): boolean {\n  \
+                 return a.start <= b.end && b.start <= a.end;\n}\n",
+            )],
+            checks: &[("src/scheduling/conflicts.ts", meeting_conflict_ok)],
         },
     ]
 }

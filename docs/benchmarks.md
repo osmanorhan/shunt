@@ -28,56 +28,16 @@ Tasks are classified by difficulty:
 | **medium** | Conditional branch insert, delete, or modification |
 | **hard** | Multi-site rename, cross-file change, error handling refactor |
 
----
+### Current status
 
-## Results — 2026-06-26
-
-### Qwen3.6-27B Q4_K_S
-
-| Task | Difficulty | Result | Avg time | Avg turns |
-|------|-----------|--------|----------|-----------|
-| change_constant | trivial | ✓ | 22 s | 7 |
-| add_function | easy | ✓ | 30 s | 16 |
-| fix_clamp | medium | ✓ | 49 s | 12 |
-| rename_two_sites | hard | ✓ | 36 s | 12 |
-| add_locked_branch | medium | ✓ | 39 s | 16 |
-| remove_legacy_mode | medium | ✓ | 24 s | 12 |
-| rename_export_import_call | hard | ✓ | 38 s | 12 |
-| thread_config_field | hard | ✓ | 52 s | 13 |
-| sync_pricing_test | hard | ✓ | 55 s | 20 |
-| move_error_handling | hard | ✓ | 64 s | 13 |
-
-**Overall: 10/10 (100%)**
-
----
-
-### Gemma-4 12B QAT
-
-| Task | Difficulty | Result | Avg time | Avg turns |
-|------|-----------|--------|----------|-----------|
-| change_constant | trivial | ✓ | 57 s | 8 |
-| add_function | easy | ✓ | 13 s | 8 |
-| fix_clamp | medium | ✓ | 72 s | 11 |
-| rename_two_sites | hard | ✓ | 32 s | 12 |
-| add_locked_branch | medium | ✓ | 24 s | 10 |
-| remove_legacy_mode | medium | ✓ | 152 s | 11 |
-| rename_export_import_call | hard | ✓ | 74 s | 11 |
-| thread_config_field | hard | ✓ | 53 s | 12 |
-| sync_pricing_test | hard | ✓ | 65 s | 12 |
-| move_error_handling | hard | ✓ | 212 s | 13 |
-
-**Overall: 10/10 (100%)**
-
----
-
-### Summary
+10-task suite, both models at 100%:
 
 | Model | Size | Overall | Avg time (hard tasks) |
 |-------|------|---------|-----------------------|
-| Qwen3.6-27B Q4_K_S | 27B | 100% | ~51 s |
-| Gemma-4 12B QAT | 12B | 100% | ~87 s |
+| Qwen3.6-27B Q4_K_S | 27B | 10/10 | ~51 s |
+| Gemma-4 12B QAT | 12B | 10/10 | ~87 s |
 
-Qwen3.6-27B is faster on hard tasks. Gemma-4 12B reaches the same success rate at a smaller model size.
+This suite is saturated at the current model sizes — see the pure-bench suite below for tasks that still discriminate.
 
 ---
 
@@ -122,6 +82,47 @@ endpoint     = "http://127.0.0.1:8080"
 model_id     = "gemma4-12b"
 timeout_secs = 120
 ```
+
+---
+
+## Pure-bench suite
+
+The capability suite runs through shunt's own harness (localization, tree-sitter ranking,
+grammar-constrained decoding). Pure-bench strips all of that away: a thin, harness-free tool
+loop (`list_files` / `read_file` / `search` / `edit_file` / `finish`) talks to the model's
+OpenAI-compatible endpoint directly. It measures the model itself — raw tool-use and reasoning
+— decoupled from anything shunt's runtime does to help it.
+
+```sh
+cargo run -p shunt-bench --bin pure -- crates/shunt-bench/pure-models.toml 1
+cargo run -p shunt-bench --bin pure -- crates/shunt-bench/pure-models.toml 3 --task=oncall_schedule_puzzle
+```
+
+### Current status
+
+39-task suite, 1 run each:
+
+| Model | Size | Overall |
+|-------|------|---------|
+| Gemma4-12B (llama.cpp, Q4_K_M) | 12B | 35/39 (90%) |
+| Qwen3.5-4B (ollama) | 4B | 27/39 (69%) |
+
+Fail points — Qwen3.5-4B (12): incomplete multi-file edits (`cra_to_vite`, `extract_auth_service`, `thread_correlation_id`), turn-cap timeouts on multi-step tasks (`node_health_route_smoke`), partial fixes left in place (`implement_optimistic_lock`, `prototype_pollution_fix`, `toctou_refresh_token`, `event_listener_leak`, `discriminated_union_types`, `idempotency_key`), a hallucinated fix on already-safe code (`no_op_sql_injection`), and misdiagnosing a vague bug report (`vague_stale_test`).
+
+Fail points — Gemma4-12B (4): one no-edit (`implement_retry_backoff`), one turn-cap timeout (`toctou_refresh_token`), one partial fix (`idempotency_key`), one hallucinated fix on already-correct pooled-connection code (`no_op_already_pooled_connections`).
+
+The no-op tasks (`no_op_sql_injection`, `no_op_cursor_pagination`, `no_op_already_pooled_connections`, `red_herring_*`) specifically catch models editing code that's already correct because a bug report sounds plausible — both models fail at least one.
+
+Reasoning tasks (novel logic uncontaminated by common OSS patterns), 3 runs each:
+
+| Task | Qwen3.5-4B | Gemma4-12B |
+|------|-----------|-----------|
+| `tiered_refund_grace_exception` | 3/3 | 3/3 |
+| `hotel_stay_length_bug` | 3/3 | 3/3 |
+| `back_to_back_meeting_overlap` | 3/3 | 3/3 |
+| `oncall_schedule_puzzle` | 2/3 | 1/3 |
+
+`oncall_schedule_puzzle` (4 engineers × 7 days, 6 interacting constraints) is the only discriminative reasoning task so far, and the only task in the suite where Gemma4-12B scores below Qwen3.5-4B — both models struggle with multi-variable constraint tracking specifically, not single-branch conditional logic. The other three reasoning tasks are solved reliably by both models and need more difficulty to be useful discriminators.
 
 ---
 
