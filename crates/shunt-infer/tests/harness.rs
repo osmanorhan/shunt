@@ -18,11 +18,9 @@ use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use serde_json::Value;
-use shunt_infer::engine::{EngineKind, detect_engine};
 use shunt_infer::{
     AgentObserver, AgentResult, AgentSession, InferResult, OllamaProvider, OpenAiCompatProvider,
-    ProposedFileOp, ProviderCapabilities, SourceFileContext, ToolCall, ToolChoiceMode,
-    ToolProvider, ToolSpec,
+    ProposedFileOp, ProviderCapabilities, SourceFileContext, ToolCall, ToolProvider, ToolSpec,
 };
 use tempfile::TempDir;
 
@@ -198,16 +196,7 @@ fn make_provider() -> AnyProvider {
     let ep = std::env::var("FRAME_LLM").expect("Set FRAME_LLM");
     let model = std::env::var("FRAME_MODEL")
         .unwrap_or_else(|_| "unsloth/gemma-4-12B-it-qat-GGUF:UD-Q4_K_XL".into());
-    let mut caps = ProviderCapabilities::detect(&model, &ep);
-    if detect_engine(&ep) == EngineKind::Ollama {
-        // Ollama grammar-constrained decoding enforces JSON structure but not content —
-        // models produce empty old_str/contents. Function calling via the /v1 shim
-        // with NamedObject mode (tool_choice={type:function,function:{name:agent_action}})
-        // routes arguments through tool_calls[].function.arguments, which is not affected
-        // by the empty-content issue that occurs when thinking goes to reasoning_content.
-        // qwen3-family small models (4B) can produce proper content via this path.
-        caps.tool_choice_mode = ToolChoiceMode::NamedObject;
-    }
+    let caps = ProviderCapabilities::detect(&model, &ep);
     AnyProvider::Compat(OpenAiCompatProvider::new(&ep, &model).with_capabilities(caps))
 }
 

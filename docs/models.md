@@ -129,7 +129,6 @@ pub struct MyModelMatcher;
 impl ModelMatcher for MyModelMatcher {
     fn match_model(&self, id: &str) -> Option<ModelProfile> {
         id.contains("my-model").then_some(ModelProfile {
-            tool_choice_mode: ToolChoiceMode::JsonSchema,
             max_tokens: 8192,
             temperature: 0.7,
             ..Default::default()
@@ -137,6 +136,8 @@ impl ModelMatcher for MyModelMatcher {
     }
 }
 ```
+
+`shunt-infer` now uses one OpenAI-compatible tool-calling path for chat servers: strict native function tools over `/v1/chat/completions`. Model matchers only provide model traits such as token budget and sampling defaults.
 
 Register it in `ModelRegistry::with_defaults()`:
 

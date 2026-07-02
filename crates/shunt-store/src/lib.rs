@@ -100,6 +100,37 @@ impl SqliteStore {
         self.list_records_for_task("frontier_cases", task_id)
     }
 
+    pub fn put_agent_pause<T>(
+        &self,
+        task_id: &str,
+        updated_at: time::OffsetDateTime,
+        pause: &T,
+    ) -> StoreResult<()>
+    where
+        T: Serialize,
+    {
+        self.put_record(
+            "agent_pauses",
+            task_id,
+            Some(task_id),
+            updated_at.unix_timestamp(),
+            pause,
+        )
+    }
+
+    pub fn get_agent_pause<T>(&self, task_id: &str) -> StoreResult<Option<T>>
+    where
+        T: DeserializeOwned,
+    {
+        self.get_record("agent_pauses", task_id)
+    }
+
+    pub fn delete_agent_pause(&self, task_id: &str) -> StoreResult<()> {
+        self.conn
+            .execute("DELETE FROM agent_pauses WHERE id = ?1", params![task_id])?;
+        Ok(())
+    }
+
     pub fn put_correction_package(&self, correction: &CorrectionPackage) -> StoreResult<()> {
         self.put_record(
             "correction_packages",
@@ -229,6 +260,14 @@ impl SqliteStore {
                 body TEXT NOT NULL
             );
             CREATE INDEX IF NOT EXISTS idx_frontier_cases_task_id ON frontier_cases(task_id);
+
+            CREATE TABLE IF NOT EXISTS agent_pauses (
+                id TEXT PRIMARY KEY,
+                task_id TEXT NOT NULL,
+                updated_at INTEGER NOT NULL,
+                body TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_agent_pauses_task_id ON agent_pauses(task_id);
 
             CREATE TABLE IF NOT EXISTS correction_packages (
                 id TEXT PRIMARY KEY,

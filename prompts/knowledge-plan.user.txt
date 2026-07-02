@@ -1,0 +1,8 @@
+Decide whether this task needs fresh external knowledge before deeper planning.
+
+original_request: {original_request}
+draft_interpreted_goal: {draft_interpreted_goal}
+workspace_profile: {workspace_profile}
+observed_evidence: {observed_evidence}
+
+If the repository is greenfield or sparse and the task depends on current recommendations, package behavior, installation, migration, or conceptual best practice, request research first.

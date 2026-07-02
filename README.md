@@ -158,10 +158,9 @@ The agent receives your workspace as context and calls tools to explore and edit
 |------|-------------|
 | `read_file` | Read a file |
 | `search_files` | Search the workspace index |
-| `replace_lines` | Edit a line range (replace, append, or delete) |
-| `write_file` | Create a new file |
-| `delete_file` | Remove a file |
-| `run_command` | Run a shell command |
+| `edit` | Create a new file (no `start_line`) or modify an existing one by line range |
+| `command` | Run a shell command |
+| `knowledge` | Query dependency/version evidence on demand |
 | `ask_user` | Ask a clarification question |
 | `done` | Signal task complete |
 

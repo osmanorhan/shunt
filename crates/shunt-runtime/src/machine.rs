@@ -80,10 +80,12 @@ impl TaskMachine {
                 ProposalReady {
                     confidence,
                     op_count,
+                    command_count,
                     snapshot,
                 },
             ) => {
-                if op_count == 0 {
+                let work_count = op_count + command_count;
+                if work_count == 0 {
                     // Nothing to apply — the agent decided no change was needed.
                     (
                         Completed,
@@ -98,13 +100,15 @@ impl TaskMachine {
                     (
                         WaitingForUser {
                             request: UserRequest::Approval {
-                                candidate_count: op_count,
+                                candidate_count: work_count,
                                 snapshot,
                             },
                         },
                         vec![
                             Effect::Notify(Notification::Note {
-                                text: format!("awaiting approval for {op_count} change(s)"),
+                                text: format!(
+                                    "awaiting approval for {work_count} proposed action(s)"
+                                ),
                             }),
                             Effect::Persist,
                         ],
@@ -128,17 +132,15 @@ impl TaskMachine {
                 AgentAsked {
                     ambiguity_id,
                     question,
+                    context,
                     options,
                 },
             ) => (
                 WaitingForUser {
-                    request: UserRequest::Clarification {
-                        open: vec![PendingAmbiguity {
-                            id: shunt_core::AmbiguityId(ambiguity_id.clone()),
-                            question: question.clone(),
-                            options: options.clone(),
-                        }],
-                        confidence: 0.0,
+                    request: UserRequest::AgentQuestion {
+                        question_id: shunt_core::AmbiguityId(ambiguity_id.clone()),
+                        question: question.clone(),
+                        context,
                     },
                 },
                 vec![
@@ -200,6 +202,35 @@ impl TaskMachine {
                     )
                 }
             }
+
+            // ── Answer a paused coding-agent question ──────────────────────
+            (
+                WaitingForUser {
+                    request:
+                        UserRequest::AgentQuestion {
+                            question_id,
+                            question: _,
+                            context: _,
+                        },
+                },
+                UserCommand(Command::Answer {
+                    ambiguity_id,
+                    answer,
+                }),
+            ) if question_id == ambiguity_id => (
+                Running,
+                vec![
+                    Effect::Notify(Notification::Note {
+                        text: "→ agent: continuing…".into(),
+                    }),
+                    Effect::ResumeAgent {
+                        artifact_id: aid.clone(),
+                        question_id,
+                        answer,
+                    },
+                    Effect::Persist,
+                ],
+            ),
 
             // ── User approves plan ────────────────────────────────────────
             (
@@ -495,6 +526,7 @@ mod tests {
             MachineEvent::ProposalReady {
                 confidence: 0.9,
                 op_count: 2,
+                command_count: 0,
                 snapshot: empty_snapshot(),
             },
             &auto_policy(),
@@ -514,6 +546,7 @@ mod tests {
             MachineEvent::ProposalReady {
                 confidence: 0.9,
                 op_count: 2,
+                command_count: 0,
                 snapshot: empty_snapshot(),
             },
             &ask_policy(),
@@ -541,11 +574,60 @@ mod tests {
             MachineEvent::ProposalReady {
                 confidence: 0.9,
                 op_count: 0,
+                command_count: 0,
                 snapshot: empty_snapshot(),
             },
             &ask_policy(),
         );
         assert!(matches!(next, TaskState::Completed));
+    }
+
+    #[test]
+    fn proposal_ready_command_only_auto_policy_commits() {
+        let (next, effects) = t(
+            TaskState::Running,
+            MachineEvent::ProposalReady {
+                confidence: 0.9,
+                op_count: 0,
+                command_count: 1,
+                snapshot: empty_snapshot(),
+            },
+            &auto_policy(),
+        );
+        assert!(matches!(next, TaskState::Running));
+        assert!(
+            effects
+                .iter()
+                .any(|e| matches!(e, Effect::CommitChange { .. }))
+        );
+    }
+
+    #[test]
+    fn proposal_ready_command_only_ask_policy_waits_for_approval() {
+        let (next, effects) = t(
+            TaskState::Running,
+            MachineEvent::ProposalReady {
+                confidence: 0.9,
+                op_count: 0,
+                command_count: 1,
+                snapshot: empty_snapshot(),
+            },
+            &ask_policy(),
+        );
+        assert!(matches!(
+            next,
+            TaskState::WaitingForUser {
+                request: UserRequest::Approval {
+                    candidate_count: 1,
+                    ..
+                }
+            }
+        ));
+        assert!(
+            !effects
+                .iter()
+                .any(|e| matches!(e, Effect::CommitChange { .. }))
+        );
     }
 
     // ── Agent asked → clarification pause ────────────────────────────────────
@@ -557,6 +639,7 @@ mod tests {
             MachineEvent::AgentAsked {
                 ambiguity_id: "agent-question".into(),
                 question: "Which config file?".into(),
+                context: String::new(),
                 options: vec![],
             },
             &auto_policy(),
@@ -564,7 +647,7 @@ mod tests {
         assert!(matches!(
             next,
             TaskState::WaitingForUser {
-                request: UserRequest::Clarification { .. }
+                request: UserRequest::AgentQuestion { .. }
             }
         ));
         assert!(
@@ -599,6 +682,40 @@ mod tests {
         );
         assert!(
             effects
+                .iter()
+                .any(|e| matches!(e, Effect::ProposeChange { .. }))
+        );
+    }
+
+    #[test]
+    fn answer_agent_question_resumes_paused_agent() {
+        let (next, effects) = t(
+            TaskState::WaitingForUser {
+                request: UserRequest::AgentQuestion {
+                    question_id: AmbiguityId("agent-question".into()),
+                    question: "Which scaffold?".into(),
+                    context: String::new(),
+                },
+            },
+            MachineEvent::UserCommand(Command::Answer {
+                ambiguity_id: AmbiguityId("agent-question".into()),
+                answer: "vite".into(),
+            }),
+            &ask_policy(),
+        );
+        assert!(matches!(next, TaskState::Running));
+        assert!(
+            effects
+                .iter()
+                .any(|e| matches!(e, Effect::ResumeAgent { .. }))
+        );
+        assert!(
+            !effects
+                .iter()
+                .any(|e| matches!(e, Effect::RecordAnswer { .. }))
+        );
+        assert!(
+            !effects
                 .iter()
                 .any(|e| matches!(e, Effect::ProposeChange { .. }))
         );
